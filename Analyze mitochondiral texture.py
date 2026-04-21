@@ -11,8 +11,8 @@ from scipy import stats
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import matplotlib.colors as mcolors
-from skimage import io, filters, feature, exposure, morphology, color, segmentation
-from matplotlib.colors import LinearSegmentedColormap, ListedColormap
+from skimage import io, filters, feature, exposure, morphology, color, segmentation, measure
+from matplotlib.colors import LinearSegmentedColormap
 from tqdm import tqdm
 import xml.etree.ElementTree as ET
 from collections import defaultdict
@@ -158,7 +158,7 @@ def segment_nuclei(img, min_nucleus_area=500, use_watershed=False):
 
     return nuclei_labels, num_cells
 
-def define_cell_territories(img_hoechst, nuclei_labels, mask_mtg, mask_tmrm, out_folder, base_name, cyto_expansion=80, mito_buffer=20, min_cyto=20, boundary_smoothing=3, save_qc=True):
+def define_cell_territories(img_hoechst, nuclei_labels, mask_mtg, out_folder, base_name, cyto_expansion=80, mito_buffer=20, min_cyto=20, boundary_smoothing=3, save_qc=True):
     """uses a topographical watershed to organically wrap around the mitochondrial networks."""
     if nuclei_labels is None:
         return None
@@ -166,8 +166,6 @@ def define_cell_territories(img_hoechst, nuclei_labels, mask_mtg, mask_tmrm, out
     mito_footprint = np.zeros(nuclei_labels.shape, dtype=bool)
     if mask_mtg is not None:
         mito_footprint |= mask_mtg
-    if mask_tmrm is not None:
-        mito_footprint |= mask_tmrm
         
     flow_channel = morphology.binary_dilation(mito_footprint, morphology.disk(3))
     mito_envelope = morphology.binary_dilation(mito_footprint, morphology.disk(mito_buffer))
@@ -284,31 +282,21 @@ def save_mask_visualisation(img, mask, out_folder, base_name, overlay_color='pur
     plt.savefig(os.path.join(out_folder, f"{base_name}_{suffix}.png"), dpi=300, bbox_inches='tight')
     plt.close(fig)
 
-def save_tmrm_mtg_overlay_qc(img_tmrm, mask_mtg, mask_tmrm, out_folder, base_name):
-    """creates a true rgb overlay to visualise physical overlap between networks and potential"""
+def save_tmrm_mtg_overlay_qc(img_tmrm, mask_mtg, out_folder, base_name):
+    """visualizes physical overlap between TMRM intensities and MTG boundaries"""
     fig, axes = plt.subplots(1, 2, figsize=(12, 6))
-    axes[0].imshow(img_tmrm, cmap='gray'); axes[0].set_title('original tmrm'); axes[0].axis('off')
+    axes[0].imshow(img_tmrm, cmap='magma'); axes[0].set_title('Raw TMRM Intensities'); axes[0].axis('off')
     
-    rgb_overlay = np.zeros((*img_tmrm.shape, 3))
+    axes[1].imshow(img_tmrm, cmap='magma')
+    axes[1].contour(mask_mtg, colors='green', linewidths=0.7)
+    axes[1].set_title('TMRM mapping within MTG network'); axes[1].axis('off')
     
-    # normalize background to act as structural guide
-    img_norm = (img_tmrm - np.min(img_tmrm)) / (np.max(img_tmrm) - np.min(img_tmrm) + 1e-8)
-    rgb_overlay[..., 0] = img_norm * 0.3
-    rgb_overlay[..., 1] = img_norm * 0.3
-    rgb_overlay[..., 2] = img_norm * 0.3
-    
-    # green mtg, red tmrm, yellow overlap
-    rgb_overlay[mask_mtg] = [0, 0.8, 0] 
-    rgb_overlay[mask_tmrm] = [0.8, 0, 0] 
-    rgb_overlay[mask_mtg & mask_tmrm] = [0.9, 0.9, 0] 
-    
-    axes[1].imshow(rgb_overlay); axes[1].set_title('green=mtg, red=tmrm, yellow=overlap'); axes[1].axis('off')
     plt.tight_layout()
-    plt.savefig(os.path.join(out_folder, f"{base_name}_tmrm_mtg_overlap_QC.png"), dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(out_folder, f"{base_name}_tmrm_mapping_QC.png"), dpi=300, bbox_inches='tight')
     plt.close(fig)
 
-def save_master_overlay_qc(img_base, mask_hoechst, mask_mtg, mask_tmrm, cell_labels, out_folder, base_name):
-    """combines all masks and boundaries into a single rational composite qc"""
+def save_master_overlay_qc(img_base, mask_hoechst, mask_mtg, cell_labels, out_folder, base_name):
+    """combines all structural boundaries into a single rational composite qc"""
     fig, ax = plt.subplots(figsize=(10, 10))
     ax.imshow(img_base, cmap='gray')
     
@@ -318,22 +306,19 @@ def save_master_overlay_qc(img_base, mask_hoechst, mask_mtg, mask_tmrm, cell_lab
     if mask_mtg is not None:
         green_rgba = np.zeros((*img_base.shape, 4)); green_rgba[mask_mtg] = [*mcolors.to_rgb('green'), 0.4]
         ax.imshow(green_rgba)
-    if mask_tmrm is not None and np.any(mask_tmrm):
-        red_rgba = np.zeros((*img_base.shape, 4)); red_rgba[mask_tmrm] = [*mcolors.to_rgb('red'), 0.4]
-        ax.imshow(red_rgba)
     if cell_labels is not None:
         boundaries = segmentation.find_boundaries(cell_labels, mode='inner')
         bound_rgba = np.zeros((*img_base.shape, 4)); bound_rgba[boundaries] = [*mcolors.to_rgb('red'), 1.0] 
         ax.imshow(bound_rgba)
         
     ax.axis('off')
-    ax.set_title('Composite: Blue=Nuclei, Green=MTG, Red_trans=TMRM, Red_solid=Cell Bounds')
+    ax.set_title('Composite: Blue=Nuclei, Green=MTG, Red=Cell Bounds')
     plt.tight_layout()
     plt.savefig(os.path.join(out_folder, f"{base_name}_master_composite_QC.png"), dpi=300, bbox_inches='tight')
     plt.close(fig)
 
-def calculate_morphology(img_base, mask, sigma=0.8, bin_thresholds=(0.4, 0.5)):
-    """calculates tubularity from hessian eigenvalues based on the constrained mask"""
+def calculate_morphology(img_base, mask, sigma=0.8):
+    """calculates continuous tubularity index from hessian eigenvalues (0.0 to 1.0)"""
     H_elems = feature.hessian_matrix(img_base, sigma=sigma, order='rc', use_gaussian_derivatives=True)
     lambda1, lambda2 = feature.hessian_matrix_eigvals(H_elems)
     
@@ -352,18 +337,12 @@ def calculate_morphology(img_base, mask, sigma=0.8, bin_thresholds=(0.4, 0.5)):
     
     smoothed_index = np.clip(smoothed_index, 0, 1)
     smoothed_index[~mask] = 0
-
-    t1, t2 = bin_thresholds
-    binned_map = np.zeros_like(smoothed_index, dtype=np.int8)
-    binned_map[mask & (smoothed_index < t1)] = 1
-    binned_map[mask & (smoothed_index >= t1) & (smoothed_index < t2)] = 2
-    binned_map[mask & (smoothed_index >= t2)] = 3
     
-    return smoothed_index, binned_map
+    return smoothed_index
 
-def save_morphology_qc(img_clahe, mask, smoothed_index, binned_map, bin_thresholds, out_folder, base_name):
-    """dumps the continuous and discrete morphology maps for manual checking"""
-    cmap_cont = LinearSegmentedColormap.from_list('tube_to_spot', ['blue', 'red'])
+def save_morphology_qc(img_clahe, mask, smoothed_index, out_folder, base_name):
+    """dumps the continuous morphology map for manual checking"""
+    cmap_cont = LinearSegmentedColormap.from_list('spot_to_tube', ['red', 'blue'])
     colored_index = cmap_cont(smoothed_index)
     colored_index[~mask] = [0, 0, 0, 1]
 
@@ -373,44 +352,20 @@ def save_morphology_qc(img_clahe, mask, smoothed_index, binned_map, bin_threshol
     fig_cont, axes_cont = plt.subplots(1, 2, figsize=(12, 6))
     axes_cont[0].imshow(img_clahe, cmap='gray'); axes_cont[0].axis('off')
     axes_cont[1].imshow(img_clahe, cmap='gray'); axes_cont[1].imshow(overlay_cont); axes_cont[1].axis('off')
+    axes_cont[1].set_title("Tubularness: Red=0 (Spotty), Blue=1 (Tubular)")
     plt.tight_layout()
     plt.savefig(os.path.join(out_folder, f"{base_name}_comp_continuous.png"), dpi=300)
     plt.close(fig_cont)
-
-    t1, t2 = bin_thresholds
-    binned_rgba = np.zeros((*img_clahe.shape, 4))
-    binned_rgba[binned_map == 1] = [*mcolors.to_rgb('#0072B2'), 0.6]
-    binned_rgba[binned_map == 2] = [*mcolors.to_rgb('#F0E442'), 0.6]
-    binned_rgba[binned_map == 3] = [*mcolors.to_rgb('#D55E00'), 0.6]
-
-    fig_disc, axes_disc = plt.subplots(1, 2, figsize=(12, 6))
-    axes_disc[0].imshow(img_clahe, cmap='gray'); axes_disc[0].axis('off')
-    axes_disc[1].imshow(img_clahe, cmap='gray'); axes_disc[1].imshow(binned_rgba); axes_disc[1].axis('off')
-    
-    legend_elements = [
-        mpatches.Patch(color='#0072B2', label=f'Tubular (< {t1})'),
-        mpatches.Patch(color='#F0E442', label='Intermediate'),
-        mpatches.Patch(color='#D55E00', label=f'Spotty (>= {t2})')
-    ]
-    axes_disc[1].legend(handles=legend_elements, loc='upper left', bbox_to_anchor=(1.05, 1))
-    plt.tight_layout()
-    plt.savefig(os.path.join(out_folder, f"{base_name}_comp_discrete.png"), dpi=300, bbox_inches='tight')
-    plt.close(fig_disc)
 
 
 # ==========================================
 # PARALLEL WORKER AND AGGREGATION
 # ==========================================
 
-def _init_worker():
-    """strictly prevents workers from inheriting any buggy TF/oneDNN state on Windows"""
-    os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
-    os.environ['OMP_NUM_THREADS'] = '1'
-
 def _worker_process_field(args):
-    """isolated worker for heavy numpy/scipy operations."""
+    """isolated worker for heavy numpy/scipy extraction operations."""
     (file_path, well_id, field_id, output_paths_dict, target_channel, 
-     tmrm_channel, nuclei_channel, sigma, tophat_radius, bin_thresholds, 
+     tmrm_channel, nuclei_channel, sigma, tophat_radius, 
      use_watershed, cyto_expansion, mito_buffer, min_cyto, boundary_smoothing, mask_method, cnn_noise_filter_radius,
      use_cnn, precomputed_mask,
      save_qc_nuclei, save_qc_mtg, save_qc_tmrm, save_qc_composite, save_qc_cnn) = args
@@ -437,8 +392,6 @@ def _worker_process_field(args):
     
     if use_cnn and precomputed_mask is not None:
         mask_mtg = precomputed_mask
-        
-        # creates a bounding region using traditional methods to filter out cnn background noise
         if cnn_noise_filter_radius > 0:
             traditional_mask = get_mask(img_tophat, sigma=2.0, method=mask_method)
             selem = morphology.disk(cnn_noise_filter_radius)
@@ -453,33 +406,27 @@ def _worker_process_field(args):
         mask_mtg = get_mask(img_tophat, sigma=2.0, method=mask_method)
 
     # 3. MTG morphology calculation
-    smoothed_index, binned_map = calculate_morphology(img_clahe, mask_mtg, sigma=sigma, bin_thresholds=bin_thresholds)
+    smoothed_index = calculate_morphology(img_clahe, mask_mtg, sigma=sigma)
     
     if save_qc_mtg:
         qc_mtg_dir = os.path.join(well_out_dir, "MTG Morphology")
         os.makedirs(qc_mtg_dir, exist_ok=True)
-        save_morphology_qc(img_clahe, mask_mtg, smoothed_index, binned_map, bin_thresholds, qc_mtg_dir, base_filename)
+        save_morphology_qc(img_clahe, mask_mtg, smoothed_index, qc_mtg_dir, base_filename)
 
-    # 4. TMRM overlap (d2)
+    # 4. TMRM alignment (d2)
     img_tmrm = load_as_float(tmrm_path)
-    mask_tmrm = np.zeros_like(mask_mtg)
     
-    if img_tmrm is not None and np.max(img_tmrm) > 0:
-        _, tmrm_tophat = preprocess_image(img_tmrm, tophat_radius)
-        mask_tmrm = get_mask(tmrm_tophat, sigma=2.0, method=mask_method)
-        
-        if save_qc_tmrm:
-            qc_tmrm_dir = os.path.join(well_out_dir, "TMRM Potential")
-            os.makedirs(qc_tmrm_dir, exist_ok=True)
-            # now overlays mtg and tmrm simultaneously 
-            save_tmrm_mtg_overlay_qc(img_tmrm, mask_mtg, mask_tmrm, qc_tmrm_dir, base_filename)
+    if save_qc_tmrm and img_tmrm is not None:
+        qc_tmrm_dir = os.path.join(well_out_dir, "TMRM Potential")
+        os.makedirs(qc_tmrm_dir, exist_ok=True)
+        save_tmrm_mtg_overlay_qc(img_tmrm, mask_mtg, qc_tmrm_dir, base_filename)
 
     # 5. Smart cell territories
     qc_nuclei_dir = os.path.join(well_out_dir, "Hoechst Cell Zones") if save_qc_nuclei else None
     if save_qc_nuclei: os.makedirs(qc_nuclei_dir, exist_ok=True)
         
     cell_labels = define_cell_territories(
-        img_hoechst, nuclei_labels, mask_mtg, mask_tmrm, 
+        img_hoechst, nuclei_labels, mask_mtg,
         qc_nuclei_dir, base_filename_hoechst, 
         cyto_expansion=cyto_expansion, mito_buffer=mito_buffer, min_cyto=min_cyto, boundary_smoothing=boundary_smoothing,
         save_qc=save_qc_nuclei
@@ -489,46 +436,55 @@ def _worker_process_field(args):
     if save_qc_composite and mask_hoechst is not None and mask_mtg is not None:
         qc_comp_dir = os.path.join(well_out_dir, "Master Composite")
         os.makedirs(qc_comp_dir, exist_ok=True)
-        save_master_overlay_qc(img_clahe, mask_hoechst, mask_mtg, mask_tmrm, cell_labels, qc_comp_dir, base_filename)
+        save_master_overlay_qc(img_clahe, mask_hoechst, mask_mtg, cell_labels, qc_comp_dir, base_filename)
 
-    # 7. Metrics extraction
+    # 7. Single Cell Extraction (Histograms & Means)
     cell_records = []
     if cell_count > 0 and cell_labels is not None:
-        cell_indices = np.arange(1, cell_count + 1)
-        mtg_per_cell = ndi.sum(mask_mtg, labels=cell_labels, index=cell_indices)
-        valid_cells = mtg_per_cell > 0 
+        props_cells = measure.regionprops(cell_labels)
+        area_dict = {p.label: p.area for p in props_cells}
         
-        if np.any(valid_cells):
-            mtg_per_cell = mtg_per_cell[valid_cells]
-            valid_indices = cell_indices[valid_cells]
+        # Mask out non-mito pixels so regionprops only looks at structural networks
+        mtg_labels = cell_labels * mask_mtg
+        props_morph = measure.regionprops(mtg_labels, intensity_image=smoothed_index)
+        
+        tmrm_dict = {}
+        if img_tmrm is not None:
+            props_tmrm = measure.regionprops(mtg_labels, intensity_image=img_tmrm)
+            tmrm_dict = {p.label: p.intensity_image[p.image] for p in props_tmrm}
+        
+        for prop in props_morph:
+            c_id = prop.label
+            morph_vals = prop.intensity_image[prop.image]
             
-            tub_per_cell = ndi.sum(binned_map == 1, labels=cell_labels, index=valid_indices)
-            int_per_cell = ndi.sum(binned_map == 2, labels=cell_labels, index=valid_indices)
-            spo_per_cell = ndi.sum(binned_map == 3, labels=cell_labels, index=valid_indices)
-            tmrm_per_cell = ndi.sum(mask_tmrm, labels=cell_labels, index=valid_indices)
-            overlap_px_per_cell = ndi.sum(mask_mtg & mask_tmrm, labels=cell_labels, index=valid_indices)
+            if len(morph_vals) == 0: continue
             
-            # cell area calculation across the organic territory mapped
-            cell_area_per_cell = ndi.sum(np.ones_like(cell_labels), labels=cell_labels, index=valid_indices)
-            tmrm_ratio_per_cell = overlap_px_per_cell / mtg_per_cell
+            # create 20 bins capturing 0.0 to 1.0 distribution
+            hist, _ = np.histogram(morph_vals, bins=20, range=(0.0, 1.0))
+            mean_morph = np.mean(morph_vals)
+            mtg_px = len(morph_vals)
             
-            for i in range(len(valid_indices)):
-                # generates a strictly unique identifier for global traceability
-                global_id = f"{well_id}_f{field_id}_c{valid_indices[i]}"
+            t_vals = tmrm_dict.get(c_id, [])
+            mean_tmrm = np.mean(t_vals) if len(t_vals) > 0 else 0.0
+            
+            global_id = f"{well_id}_f{field_id}_c{c_id}"
+            
+            record = {
+                "Global_Cell_ID": global_id,
+                "Well_ID": well_id, 
+                "Field": field_id, 
+                "Local_Cell_ID": c_id,
+                "Cell_Area": area_dict.get(c_id, 0),
+                "Mito_Px": mtg_px,
+                "Mean_Morphology": mean_morph,
+                "Mean_TMRM_Intensity": mean_tmrm
+            }
+            
+            # Unpack histogram into columns for safety and portability
+            for b in range(20):
+                record[f"Hist_Bin_{b+1:02d}"] = hist[b]
                 
-                cell_records.append({
-                    "Global_Cell_ID": global_id,
-                    "Well_ID": well_id, 
-                    "Field": field_id, 
-                    "Local_Cell_ID": valid_indices[i],
-                    "Cell_Area": cell_area_per_cell[i],
-                    "Mito_Px": mtg_per_cell[i],
-                    "Tubular_Px": tub_per_cell[i],
-                    "Interme_Px": int_per_cell[i],
-                    "Spotty_Px": spo_per_cell[i],
-                    "TMRM_Px": tmrm_per_cell[i],
-                    "TMRM_Overlap_Ratio": tmrm_ratio_per_cell[i]
-                })
+            cell_records.append(record)
 
     return cell_records
 
@@ -557,81 +513,113 @@ def add_stat_annotation(ax, data, x_col, y_col, ref_cond):
         
         if p < 0.05:
             stars = '*' if p >= 0.01 else '**' if p >= 0.001 else '***'
-            # draws significance bracket
             ax.plot([ref_idx, ref_idx, i, i], [current_y, current_y+step/3, current_y+step/3, current_y], lw=1.5, c='k')
             ax.text((ref_idx + i) / 2, current_y + step/3, stars, ha='center', va='bottom', color='k')
             current_y += step * 1.5
 
 def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv_path_override=None):
-    """saves a massive single-cell dataframe or loads an existing one, then handles statistical boxplots"""
+    """saves single-cell morphological and potential data, plots continuous distribution curves, and boxplots"""
     if csv_path_override and os.path.exists(csv_path_override):
         df_cells = pd.read_csv(csv_path_override)
         parent_out_dir = os.path.dirname(csv_path_override)
-        print(f"\nloaded existing single-cell dataset from: {csv_path_override}")
+        print(f"\nLoaded existing single-cell dataset from: {csv_path_override}")
     else:
         if not all_cell_data: return
         
         parent_out_dir = os.path.dirname(output_paths_dict[all_cell_data[0]["Well_ID"]])
         csv_path = os.path.join(parent_out_dir, "Plate_SingleCell_Morphology_Data.csv")
         
-        # master pandas dataframe creation
         df_cells = pd.DataFrame(all_cell_data)
-        
-        # maps condition and rationally reorders columns for better readability
         df_cells['Condition'] = df_cells['Well_ID'].map(treatment_map).fillna("Untreated")
-        cols = ['Global_Cell_ID', 'Well_ID', 'Condition', 'Field', 'Local_Cell_ID'] + [c for c in df_cells.columns if c not in ['Global_Cell_ID', 'Well_ID', 'Condition', 'Field', 'Local_Cell_ID']]
+        
+        # cleanly order metadata vs dynamic bin columns
+        meta_cols = ['Global_Cell_ID', 'Well_ID', 'Condition', 'Field', 'Local_Cell_ID', 'Cell_Area', 'Mito_Px', 'Mean_Morphology', 'Mean_TMRM_Intensity']
+        hist_cols = [c for c in df_cells.columns if c.startswith('Hist_Bin_')]
+        cols = meta_cols + hist_cols
         df_cells = df_cells[cols]
         
-        # save the heavy single-cell dataframe so we never have to re-extract for custom plotting
         df_cells.to_csv(csv_path, index=False)
-        print(f"\nexported single-cell master dataset to: {csv_path}")
+        print(f"\nExported single-cell master dataset to: {csv_path}")
             
-    # aggregate to well level (median) to strictly avoid pseudoreplication in statistics
-    well_df = df_cells.groupby(['Well_ID', 'Condition']).agg(
-        Cell_Count=('Global_Cell_ID', 'count'),
-        Cell_Area=('Cell_Area', 'median'),
-        Tubular=('Tubular_Px', 'median'),
-        Intermediate=('Interme_Px', 'median'),
-        Spotty=('Spotty_Px', 'median'),
-        TMRM_Ratio=('TMRM_Overlap_Ratio', 'median')
-    ).reset_index()
+    # Aggregation mapping to strictly avoid pseudoreplication
+    agg_funcs = {
+        'Global_Cell_ID': 'count',
+        'Cell_Area': 'median',
+        'Mean_Morphology': 'median',
+        'Mean_TMRM_Intensity': 'median'
+    }
+    for b in range(1, 21):
+        if f'Hist_Bin_{b:02d}' in df_cells.columns:
+            agg_funcs[f'Hist_Bin_{b:02d}'] = 'sum'
+            
+    well_df = df_cells.groupby(['Well_ID', 'Condition']).agg(agg_funcs).rename(columns={'Global_Cell_ID': 'Cell_Count'}).reset_index()
     
     conditions = sorted(well_df['Condition'].unique())
     ref_cond = "Vehicle" if "Vehicle" in conditions else conditions[0]
-
     sns.set_style("whitegrid")
     
+    # ----------------------------------------------------
+    # 1. Plot Continuous Morphology Distributions
+    # ----------------------------------------------------
+    fig_dist, ax_dist = plt.subplots(figsize=(10, 6))
+    bin_centers = np.linspace(0.025, 0.975, 20)
+    colors = sns.color_palette("husl", len(conditions))
+    
+    for i, cond in enumerate(conditions):
+        cond_data = well_df[well_df['Condition'] == cond]
+        if cond_data.empty: continue
+        
+        norm_hists = []
+        for _, row in cond_data.iterrows():
+            if row['Cell_Count'] > 0:
+                hist_vals = np.array([row.get(f'Hist_Bin_{b:02d}', 0) for b in range(1, 21)])
+                norm_hists.append(hist_vals / row['Cell_Count'])
+                
+        if norm_hists:
+            norm_hists = np.array(norm_hists)
+            mean_hist = np.mean(norm_hists, axis=0)
+            sem_hist = stats.sem(norm_hists, axis=0) if len(norm_hists) > 1 else np.zeros_like(mean_hist)
+            
+            line, = ax_dist.plot(bin_centers, mean_hist, label=cond, color=colors[i], lw=2)
+            ax_dist.fill_between(bin_centers, mean_hist - sem_hist, mean_hist + sem_hist, alpha=0.2, color=colors[i])
+
+    ax_dist.set_title("Continuous Mitochondrial Tubularness Distribution", fontsize=14, fontweight='bold')
+    ax_dist.set_xlabel("Tubularness Index (0=Spotty, 1=Tubular)")
+    ax_dist.set_ylabel("Average Pixel Area per Cell")
+    ax_dist.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.tight_layout()
+    plt.savefig(os.path.join(parent_out_dir, "Condition_Morphology_Distribution.png"), dpi=300, bbox_inches='tight')
+    plt.close(fig_dist)
+
+    # ----------------------------------------------------
+    # 2. Boxplot Analytics 
+    # ----------------------------------------------------
     metrics = [
         ('Cell_Count', 'Total Cells per Well', 'grey'),
         ('Cell_Area', 'Cell Area (Px)', 'brown'),
-        ('Tubular', 'Tubular Network (Px/Cell)', '#0072B2'),
-        ('Intermediate', 'Intermediate Network (Px/Cell)', '#F0E442'),
-        ('Spotty', 'Fragmented Network (Px/Cell)', '#D55E00'),
-        ('TMRM_Ratio', 'Membrane Potential (TMRM/MTG Ratio)', 'purple')
+        ('Mean_Morphology', 'Mean Tubularness Index per Well', '#0072B2'),
+        ('Mean_TMRM_Intensity', 'Mean TMRM Intensity per Well', 'purple')
     ]
     
-    # setup text file for logging outliers rationally
-    outlier_log_path = os.path.join(parent_out_dir, "Analysis outliers.txt")
+    outlier_log_path = os.path.join(parent_out_dir, "Analysis_Outliers.txt")
     with open(outlier_log_path, "w") as outlier_log:
         outlier_log.write("Identification of statistical outliers (1.5 * iqr)\n")
         outlier_log.write("="*60 + "\n")
         
-        # generates and saves a separate, cleanly proportioned plot for each metric
         for col, title, color in metrics:
-            fig, ax = plt.subplots(figsize=(8, 6))
+            if col not in well_df.columns: continue
             
+            fig, ax = plt.subplots(figsize=(8, 6))
             outlier_log.write(f"\n--- {title} ({col}) ---\n")
             outliers_found_for_metric = False
-            
-            # carefully partition the data so stripplot doesn't paint filled circles over our hollow outliers
             non_outlier_indices = []
+            
             for cond in conditions:
                 cond_data = well_df[well_df['Condition'] == cond]
                 if len(cond_data) < 3:
                     non_outlier_indices.extend(cond_data.index)
                     continue
                 
-                # exactly matches matplotlib's native boxplot stats
                 q1, q3 = np.percentile(cond_data[col].dropna(), [25, 75])
                 iqr = q3 - q1
                 lower_bound = q1 - 1.5 * iqr
@@ -644,7 +632,7 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
                     outliers_found_for_metric = True
                     outlier_log.write(f"  > {cond}:\n")
                     for _, row in outliers.iterrows():
-                        outlier_log.write(f"      well {row['Well_ID']} - value: {row[col]:.3f}\n")
+                        outlier_log.write(f"     well {row['Well_ID']} - value: {row[col]:.3f}\n")
                         
                 non_outlier_indices.extend(normals.index)
                 
@@ -653,11 +641,9 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
                 
             df_normals = well_df.loc[non_outlier_indices]
             
-            # standard boxplot with strictly unfilled outlier markers
             flierprops = dict(marker='o', markerfacecolor='none', markeredgecolor='black', markersize=7, alpha=0.8)
             sns.boxplot(data=well_df, x='Condition', y=col, ax=ax, color=color, showfliers=True, flierprops=flierprops, width=0.5, boxprops=dict(alpha=0.6))
             
-            # plot the internal points ONLY for the normal distribution range
             if not df_normals.empty:
                 sns.stripplot(data=df_normals, x='Condition', y=col, ax=ax, color='black', alpha=0.7, jitter=True, size=6)
             
@@ -668,7 +654,6 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
             ax.set_title(title.split('(')[0].strip(), fontsize=14, fontweight='bold')
             ax.tick_params(axis='x', rotation=45)
             
-            # fixes the broken x-axis labels using intelligent text wrapping
             labels = [item.get_text() for item in ax.get_xticklabels()]
             wrapped_labels = ['\n'.join(textwrap.wrap(label, width=20)) for label in labels]
             ax.set_xticklabels(wrapped_labels, rotation=45, ha='right', fontsize=9)
@@ -681,14 +666,13 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
 def process_plate_directory(
     data_dir, output_paths_dict, treatment_map, 
     target_channel="1", tmrm_channel="2", nuclei_channel="0", 
-    sigma=1.5, tophat_radius=5, test_well=None, bin_thresholds=(0.4, 0.5), 
+    sigma=1.5, tophat_radius=5, test_well=None,
     use_watershed=False, cyto_expansion=80, mito_buffer=20, min_cyto=20, boundary_smoothing=3,
     mask_method='triangle', cnn_noise_filter_radius=25,
     use_cnn=False, cnn_model_path=None,
     save_qc_nuclei=True, save_qc_mtg=True, save_qc_tmrm=True, save_qc_composite=True, save_qc_cnn=True,
     plot_only=False, master_csv_path=None
 ):
-    # rationally short-circuits the entire image processing pipeline if we just want to re-plot
     if plot_only:
         print("\n--- phase: plotting only (skipping image extraction) ---")
         if master_csv_path and os.path.exists(master_csv_path):
@@ -708,18 +692,21 @@ def process_plate_directory(
     cnn_masks_dict = {}
     
     if use_cnn and cnn_model_path:
-        print("\n--- Phase 1: Sequential CNN Inference ---")
-        os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-        os.environ['OMP_NUM_THREADS'] = '1' 
-        os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0' 
-        
+        print("\n--- Phase 1: CNN Inference ---")
         import tensorflow as tf
         import tensorflow.keras.backend as K
         
-        tf.config.set_visible_devices([], 'GPU')
-        tf.config.threading.set_inter_op_parallelism_threads(1)
-        tf.config.threading.set_intra_op_parallelism_threads(1)
-        
+        physical_devices = tf.config.list_physical_devices('GPU')
+        if physical_devices:
+            print(f"Found {len(physical_devices)} GPU(s). Enabling hardware acceleration...")
+            try:
+                for gpu in physical_devices:
+                    tf.config.experimental.set_memory_growth(gpu, True)
+            except RuntimeError as e:
+                print(f"Failed to set memory growth: {e}")
+        else:
+            print("No GPU detected. Executing on CPU.")
+
         print("Loading TensorFlow model...")
         model = tf.keras.models.load_model(cnn_model_path, compile=False)
         patch_h, patch_w = model.input_shape[1:3]
@@ -734,7 +721,6 @@ def process_plate_directory(
             cnn_masks_dict[f] = generate_cnn_mask_sequential(img_clahe, model, patch_h, patch_w, suppress_output=True)
 
         print("--- Phase 1 Complete. Clearing Neural Engine... ---")
-        # radical memory and thread lock purging
         del model
         K.clear_session()
         gc.collect()
@@ -746,18 +732,17 @@ def process_plate_directory(
         match = pattern.search(f)
         tasks.append((
             f, match.group(1), match.group(2), output_paths_dict, target_channel, tmrm_channel, nuclei_channel, 
-            sigma, tophat_radius, bin_thresholds, use_watershed, 
+            sigma, tophat_radius, use_watershed, 
             cyto_expansion, mito_buffer, min_cyto, boundary_smoothing, mask_method, cnn_noise_filter_radius,
             use_cnn, cnn_masks_dict.get(f), 
             save_qc_nuclei, save_qc_mtg, save_qc_tmrm, save_qc_composite, save_qc_cnn
         ))
 
     all_cell_data = []
-    # on windows with cnn masks in ram, we limit to 6 cores max to prevent pickle-overhead lag
     max_workers = min(6, os.cpu_count() - 1, len(tasks)) if os.cpu_count() else 1
     
     print(f"Spawning {max_workers} isolated processes...")
-    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers, initializer=_init_worker) as executor:
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(_worker_process_field, t): t for t in tasks}
         for future in tqdm(concurrent.futures.as_completed(futures), total=len(tasks), desc="Calculating Morphology"):
             res = future.result()
@@ -780,16 +765,16 @@ if __name__ == "__main__":
     out_dir, paths_dict = setup_output(base_dir, "Output Images plate 3", zero_pad=True)
     treatment_dictionary = parse_tecan_d300e_xml(dtt_path)
     
-    # define the path to your previously generated master csv
     existing_csv_path = os.path.join(out_dir, "Plate_SingleCell_Morphology_Data.csv")
     
     process_plate_directory(
         data_dir=data_path, output_paths_dict=paths_dict, treatment_map=treatment_dictionary,
         target_channel="1", tmrm_channel="2", nuclei_channel="0", 
         use_cnn=True, cnn_model_path=cnn_model_file,
-        sigma=1.5, tophat_radius=6, test_well=None, bin_thresholds=(0.4, 0.5),
+        sigma=1.5, tophat_radius=6, test_well=None,
         use_watershed=True, cyto_expansion=80, mito_buffer=20, min_cyto=20, boundary_smoothing=3,
         mask_method='triangle', cnn_noise_filter_radius=10,
         save_qc_nuclei=True, save_qc_mtg=True, save_qc_tmrm=True, save_qc_composite=True, save_qc_cnn=True,
-        plot_only=True, master_csv_path=existing_csv_path
+        plot_only=False, master_csv_path=existing_csv_path
     )
+
