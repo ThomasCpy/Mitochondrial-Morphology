@@ -3,7 +3,6 @@ import re
 import csv
 import glob
 import textwrap
-import tempfile
 import numpy as np
 import pandas as pd
 import seaborn as sns
@@ -195,7 +194,8 @@ def define_cell_territories(img_hoechst, nuclei_labels, mask_mtg, out_folder, ba
         axes[1].imshow(bound_img); axes[1].set_title(f'organic cell zones ({np.max(nuclei_labels)})'); axes[1].axis('off')
         plt.tight_layout()
         plt.savefig(os.path.join(out_folder, f"{base_name}_cell_zones_QC.png"), dpi=300, bbox_inches='tight')
-        plt.close(fig)
+        fig.clf()
+        plt.close('all')
         
     return cell_labels
 
@@ -275,14 +275,16 @@ def save_mask_visualisation(img, mask, out_folder, base_name, overlay_color='pur
     axes[0].imshow(img, cmap='gray'); axes[0].set_title('original image'); axes[0].axis('off')
     axes[1].imshow(img, cmap='gray')
     
-    rgba = np.zeros((*img.shape, 4))
+    # memory fix: force uint8 (8-bit) array instead of float64 (64-bit) to prevent RAM explosion
+    rgba = np.zeros((*img.shape, 4), dtype=np.uint8)
     rgb_color = mcolors.to_rgb(overlay_color)
-    rgba[mask] = [*rgb_color, alpha]
+    rgba[mask] = [int(c * 255) for c in rgb_color] + [int(alpha * 255)]
     
     axes[1].imshow(rgba); axes[1].set_title('mask overlay'); axes[1].axis('off')
     plt.tight_layout()
     plt.savefig(os.path.join(out_folder, f"{base_name}_{suffix}.png"), dpi=300, bbox_inches='tight')
-    plt.close(fig)
+    fig.clf()
+    plt.close('all')
 
 def save_tmrm_mtg_overlay_qc(img_tmrm, mask_mtg, out_folder, base_name):
     """visualizes physical overlap between TMRM intensities and MTG boundaries"""
@@ -295,29 +297,35 @@ def save_tmrm_mtg_overlay_qc(img_tmrm, mask_mtg, out_folder, base_name):
     
     plt.tight_layout()
     plt.savefig(os.path.join(out_folder, f"{base_name}_tmrm_mapping_QC.png"), dpi=300, bbox_inches='tight')
-    plt.close(fig)
+    fig.clf()
+    plt.close('all')
 
 def save_master_overlay_qc(img_base, mask_hoechst, mask_mtg, cell_labels, out_folder, base_name):
     """combines all structural boundaries into a single rational composite qc"""
     fig, ax = plt.subplots(figsize=(10, 10))
     ax.imshow(img_base, cmap='gray')
     
+    # memory fix: force uint8 arrays. float64 arrays of 2843x2843x4 take exactly 247 MiB of RAM each!
     if mask_hoechst is not None:
-        blue_rgba = np.zeros((*img_base.shape, 4)); blue_rgba[mask_hoechst] = [*mcolors.to_rgb('blue'), 0.4]
+        blue_rgba = np.zeros((*img_base.shape, 4), dtype=np.uint8)
+        blue_rgba[mask_hoechst] = [0, 0, 255, int(0.4 * 255)]
         ax.imshow(blue_rgba)
     if mask_mtg is not None:
-        green_rgba = np.zeros((*img_base.shape, 4)); green_rgba[mask_mtg] = [*mcolors.to_rgb('green'), 0.4]
+        green_rgba = np.zeros((*img_base.shape, 4), dtype=np.uint8)
+        green_rgba[mask_mtg] = [0, 128, 0, int(0.4 * 255)]
         ax.imshow(green_rgba)
     if cell_labels is not None:
         boundaries = segmentation.find_boundaries(cell_labels, mode='inner')
-        bound_rgba = np.zeros((*img_base.shape, 4)); bound_rgba[boundaries] = [*mcolors.to_rgb('red'), 1.0] 
+        bound_rgba = np.zeros((*img_base.shape, 4), dtype=np.uint8)
+        bound_rgba[boundaries] = [255, 0, 0, 255] 
         ax.imshow(bound_rgba)
         
     ax.axis('off')
     ax.set_title('Composite: Blue=Nuclei, Green=MTG, Red=Cell Bounds')
     plt.tight_layout()
     plt.savefig(os.path.join(out_folder, f"{base_name}_master_composite_QC.png"), dpi=300, bbox_inches='tight')
-    plt.close(fig)
+    fig.clf()
+    plt.close('all')
 
 def calculate_morphology(img_base, mask, sigma=0.8):
     """calculates continuous tubularity index from hessian eigenvalues (0.0 to 1.0)"""
@@ -325,7 +333,15 @@ def calculate_morphology(img_base, mask, sigma=0.8):
     lambda1, lambda2 = feature.hessian_matrix_eigvals(H_elems)
     
     epsilon = 1e-8
-    morphology_index = np.abs(lambda1) / (np.abs(lambda2) + epsilon)
+    # lambda2 is the cross-sectional curvature (large absolute value for tubes)
+    # lambda1 is the longitudinal curvature (small absolute value for tubes)
+    # the ratio approaches 0 for tubular structures and 1 for spotty/circular structures
+    ratio = np.abs(lambda1) / (np.abs(lambda2) + epsilon)
+    
+    # invert the scale so 1.0 = highly tubular and 0.0 = spotty
+    morphology_index = 1.0 - ratio
+    
+    # dark background means eigenvalues should be negative for bright ridges
     morphology_index[lambda2 > 0] = 0
     morphology_index = np.clip(morphology_index, 0, 1)
 
@@ -345,11 +361,13 @@ def calculate_morphology(img_base, mask, sigma=0.8):
 def save_morphology_qc(img_clahe, mask, smoothed_index, out_folder, base_name):
     """dumps the continuous morphology map for manual checking"""
     cmap_cont = LinearSegmentedColormap.from_list('spot_to_tube', ['red', 'blue'])
-    colored_index = cmap_cont(smoothed_index)
-    colored_index[~mask] = [0, 0, 0, 1]
+    
+    # memory fix: cmap returns float64, immediately scale and cast to uint8
+    colored_index = (cmap_cont(smoothed_index) * 255).astype(np.uint8)
+    colored_index[~mask] = [0, 0, 0, 255]
 
     overlay_cont = np.copy(colored_index)
-    overlay_cont[..., 3] = np.where(mask, 0.6, 0.0)
+    overlay_cont[..., 3] = np.where(mask, int(0.6 * 255), 0)
 
     fig_cont, axes_cont = plt.subplots(1, 2, figsize=(12, 6))
     axes_cont[0].imshow(img_clahe, cmap='gray'); axes_cont[0].axis('off')
@@ -357,7 +375,8 @@ def save_morphology_qc(img_clahe, mask, smoothed_index, out_folder, base_name):
     axes_cont[1].set_title("Tubularness: Red=0 (Spotty), Blue=1 (Tubular)")
     plt.tight_layout()
     plt.savefig(os.path.join(out_folder, f"{base_name}_comp_continuous.png"), dpi=300)
-    plt.close(fig_cont)
+    fig_cont.clf()
+    plt.close('all')
 
 
 # ==========================================
@@ -369,7 +388,7 @@ def _worker_process_field(args):
     (file_path, well_id, field_id, output_paths_dict, target_channel, 
      tmrm_channel, nuclei_channel, sigma, tophat_radius, 
      use_watershed, cyto_expansion, mito_buffer, min_cyto, boundary_smoothing, mask_method, cnn_noise_filter_radius,
-     use_cnn, precomputed_mask_path, # Changed to path string to prevent RAM explosions!
+     use_cnn, precomputed_mask,
      save_qc_nuclei, save_qc_mtg, save_qc_tmrm, save_qc_composite, save_qc_cnn) = args
     
     well_out_dir = output_paths_dict.get(well_id)
@@ -392,11 +411,8 @@ def _worker_process_field(args):
         
     img_clahe, img_tophat = preprocess_image(img_mtg, tophat_radius)
     
-    if use_cnn and precomputed_mask_path is not None and os.path.exists(precomputed_mask_path):
-        # Load mask from disk to save RAM, then clean it up immediately
-        mask_mtg = np.load(precomputed_mask_path)
-        os.remove(precomputed_mask_path) 
-        
+    if use_cnn and precomputed_mask is not None:
+        mask_mtg = precomputed_mask
         if cnn_noise_filter_radius > 0:
             traditional_mask = get_mask(img_tophat, sigma=2.0, method=mask_method)
             selem = morphology.disk(cnn_noise_filter_radius)
@@ -521,25 +537,29 @@ def add_stat_annotation(ax, data, x_col, y_col, ref_cond):
             ax.text((ref_idx + i) / 2, current_y + step/3, stars, ha='center', va='bottom', color='k')
             current_y += step * 1.5
 
-def aggregate_and_plot_data(csv_path, treatment_map):
-    """loads highly-optimized CSV directly into pandas, plots continuous distribution curves, and boxplots"""
-    if not csv_path or not os.path.exists(csv_path):
-        print(f"Error: Could not find aggregated data at {csv_path}.")
-        return
-
-    parent_out_dir = os.path.dirname(csv_path)
-    print(f"\nLoading optimized dataset for plotting from: {csv_path}")
-    
-    # Load from disk instead of RAM to prevent array memory errors
-    df_cells = pd.read_csv(csv_path)
-    
-    # Map conditions directly on the dataframe
-    if 'Condition' not in df_cells.columns:
+def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv_path_override=None):
+    """saves single-cell morphological and potential data, plots continuous distribution curves, and boxplots"""
+    if csv_path_override and os.path.exists(csv_path_override):
+        df_cells = pd.read_csv(csv_path_override)
+        parent_out_dir = os.path.dirname(csv_path_override)
+        print(f"\nLoaded existing single-cell dataset from: {csv_path_override}")
+    else:
+        if not all_cell_data: return
+        
+        parent_out_dir = os.path.dirname(output_paths_dict[all_cell_data[0]["Well_ID"]])
+        csv_path = os.path.join(parent_out_dir, "Plate_SingleCell_Morphology_Data.csv")
+        
+        df_cells = pd.DataFrame(all_cell_data)
         df_cells['Condition'] = df_cells['Well_ID'].map(treatment_map).fillna("Untreated")
-        # Save condition column back to the master file
+        
+        meta_cols = ['Global_Cell_ID', 'Well_ID', 'Condition', 'Field', 'Local_Cell_ID', 'Cell_Area', 'Mito_Px', 'Mean_Morphology', 'Mean_TMRM_Intensity']
+        hist_cols = [c for c in df_cells.columns if c.startswith('Hist_Bin_')]
+        cols = meta_cols + hist_cols
+        df_cells = df_cells[cols]
+        
         df_cells.to_csv(csv_path, index=False)
-        print("Mapped Tecan treatments and saved back to master CSV.")
-
+        print(f"\nExported single-cell master dataset to: {csv_path}")
+            
     agg_funcs = {
         'Global_Cell_ID': 'count',
         'Cell_Area': 'median',
@@ -659,7 +679,8 @@ def aggregate_and_plot_data(csv_path, treatment_map):
             plt.tight_layout()
             plot_filename = f"Condition_{col}_Boxplot.png"
             plt.savefig(os.path.join(parent_out_dir, plot_filename), dpi=300, bbox_inches='tight')
-            plt.close(fig)
+            fig.clf()
+            plt.close('all')
 
 def process_plate_directory(
     data_dir, output_paths_dict, treatment_map, 
@@ -674,7 +695,7 @@ def process_plate_directory(
     if plot_only:
         print("\n--- phase: plotting only (skipping image extraction) ---")
         if master_csv_path and os.path.exists(master_csv_path):
-            aggregate_and_plot_data(master_csv_path, treatment_map)
+            aggregate_and_plot_data(None, None, None, csv_path_override=master_csv_path)
         else:
             print(f"error: plot_only is true but valid master_csv_path was not found at {master_csv_path}")
         return
@@ -720,21 +741,12 @@ def process_plate_directory(
             print(f"Model loaded. Generating structural masks with patch size ({patch_h}x{patch_w})...\n")
             
             for f in tqdm(target_files, desc="Processing Images"):
-                match = pattern.search(f)
-                well_id = match.group(1)
-                well_out_dir = output_paths_dict.get(well_id)
-
                 img_mtg = load_as_float(f)
                 if img_mtg is None or np.max(img_mtg) == 0: continue
                 img_clahe, _ = preprocess_image(img_mtg, tophat_radius)
                 
-                # Suppressed output to True here so \r doesn't break tqdm bar formatting
-                mask = generate_cnn_mask_sequential(img_clahe, sess, input_name, patch_h, patch_w, suppress_output=True)
-                
-                # To prevent RAM exhaustion, save mask to disk and give the worker the file path.
-                temp_mask_path = os.path.join(well_out_dir, f"temp_cnn_mask_{os.path.basename(f)}.npy")
-                np.save(temp_mask_path, mask)
-                cnn_masks_dict[f] = temp_mask_path
+                # Execute inference using ONNX
+                cnn_masks_dict[f] = generate_cnn_mask_sequential(img_clahe, sess, input_name, patch_h, patch_w, suppress_output=False)
 
             print("\n--- Phase 1 Complete. Releasing VRAM... ---")
             del sess
@@ -758,33 +770,18 @@ def process_plate_directory(
             save_qc_nuclei, save_qc_mtg, save_qc_tmrm, save_qc_composite, save_qc_cnn
         ))
 
-    # Dynamically determine master CSV path and ensure it's empty
-    parent_out_dir = os.path.dirname(list(output_paths_dict.values())[0])
-    csv_path = master_csv_path or os.path.join(parent_out_dir, "Plate_SingleCell_Morphology_Data.csv")
-    if os.path.exists(csv_path):
-        os.remove(csv_path)
-
+    all_cell_data = []
     max_workers = min(6, os.cpu_count() - 1, len(tasks)) if os.cpu_count() else 1
     
     print(f"Spawning {max_workers} isolated processes...")
-    first_write = True
     with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(_worker_process_field, t): t for t in tasks}
-        
         for future in tqdm(concurrent.futures.as_completed(futures), total=len(tasks), desc="Calculating Morphology"):
             res = future.result()
-            if res:
-                # Append directly to the CSV chunk-by-chunk to save massive amounts of RAM
-                df_chunk = pd.DataFrame(res)
-                df_chunk.to_csv(csv_path, mode='a', header=first_write, index=False)
-                first_write = False
-                
-                # Wipe from RAM
-                del res
-                del df_chunk
+            if res: all_cell_data.extend(res)
 
-    # Call aggregation directly from disk
-    aggregate_and_plot_data(csv_path, treatment_map)
+    if all_cell_data:
+        aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map)
 
 
 # ==========================================
