@@ -223,8 +223,8 @@ def get_mask(img_tophat, sigma=2.0, method='triangle'):
     mask = morphology.remove_small_objects(mask, max_size=10)
     return mask
 
-def generate_cnn_mask_sequential(img, model, patch_h, patch_w, suppress_output=True):
-    """applies the cnn using rational block-tiling"""
+def generate_cnn_mask_sequential(img, sess, input_name, patch_h, patch_w, suppress_output=False):
+    """applies the cnn using ONNX runtime and rational block-tiling"""
     img_norm = (img - np.min(img)) / (np.max(img) - np.min(img) + 1e-8)
     img_8bit = (img_norm * 255).astype(np.float32)
 
@@ -243,19 +243,20 @@ def generate_cnn_mask_sequential(img, model, patch_h, patch_w, suppress_output=T
     for i in range(0, padded_h, patch_h):
         for j in range(0, padded_w, patch_w):
             tile = img_padded[i:i+patch_h, j:j+patch_w]
-            tile_batch = np.expand_dims(np.expand_dims(tile, axis=0), axis=-1)
+            # ONNX expects float32 arrays
+            tile_batch = np.expand_dims(np.expand_dims(tile, axis=0), axis=-1).astype(np.float32)
             
             if not suppress_output:
-                print(f"\n    -> inferring tile {tile_idx}/{total_tiles}...", end="", flush=True)
+                print(f"      [Tile {tile_idx:02d}/{total_tiles:02d}] inferring on GPU...", end="\r", flush=True)
             
-            pred = model.predict_on_batch(tile_batch)
+            # ONNX execution
+            pred = sess.run(None, {input_name: tile_batch})[0]
             
-            if not suppress_output:
-                print(" done.", flush=True)
-            
-            pred_array = pred.numpy() if hasattr(pred, 'numpy') else np.array(pred)
-            pred_padded[i:i+patch_h, j:j+patch_w] = pred_array[0, :, :, 0]
+            pred_padded[i:i+patch_h, j:j+patch_w] = pred[0, :, :, 0]
             tile_idx += 1
+            
+    if not suppress_output:
+        print(" " * 65, end="\r") # clear the line once done
 
     pred_mask = pred_padded > 0.5 
     mask = pred_mask[:h, :w]
@@ -480,7 +481,6 @@ def _worker_process_field(args):
                 "Mean_TMRM_Intensity": mean_tmrm
             }
             
-            # Unpack histogram into columns for safety and portability
             for b in range(20):
                 record[f"Hist_Bin_{b+1:02d}"] = hist[b]
                 
@@ -532,7 +532,6 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
         df_cells = pd.DataFrame(all_cell_data)
         df_cells['Condition'] = df_cells['Well_ID'].map(treatment_map).fillna("Untreated")
         
-        # cleanly order metadata vs dynamic bin columns
         meta_cols = ['Global_Cell_ID', 'Well_ID', 'Condition', 'Field', 'Local_Cell_ID', 'Cell_Area', 'Mito_Px', 'Mean_Morphology', 'Mean_TMRM_Intensity']
         hist_cols = [c for c in df_cells.columns if c.startswith('Hist_Bin_')]
         cols = meta_cols + hist_cols
@@ -541,7 +540,6 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
         df_cells.to_csv(csv_path, index=False)
         print(f"\nExported single-cell master dataset to: {csv_path}")
             
-    # Aggregation mapping to strictly avoid pseudoreplication
     agg_funcs = {
         'Global_Cell_ID': 'count',
         'Cell_Area': 'median',
@@ -692,39 +690,52 @@ def process_plate_directory(
     cnn_masks_dict = {}
     
     if use_cnn and cnn_model_path:
-        print("\n--- Phase 1: CNN Inference ---")
-        import tensorflow as tf
-        import tensorflow.keras.backend as K
-        
-        physical_devices = tf.config.list_physical_devices('GPU')
-        if physical_devices:
-            print(f"Found {len(physical_devices)} GPU(s). Enabling hardware acceleration...")
-            try:
-                for gpu in physical_devices:
-                    tf.config.experimental.set_memory_growth(gpu, True)
-            except RuntimeError as e:
-                print(f"Failed to set memory growth: {e}")
-        else:
-            print("No GPU detected. Executing on CPU.")
+        print("\n--- Phase 1: ONNX GPU Inference ---")
+        try:
+            import onnxruntime as ort
+        except ImportError:
+            print("\n[!] ERROR: onnxruntime is not installed.")
+            print("Please run: pip install onnxruntime-directml\n")
+            return
 
-        print("Loading TensorFlow model...")
-        model = tf.keras.models.load_model(cnn_model_path, compile=False)
-        patch_h, patch_w = model.input_shape[1:3]
-        if patch_h is None: patch_h, patch_w = 656, 656
+        # Request DirectML (Windows GPU) first, fallback to CPU if it fails
+        providers = ['DmlExecutionProvider', 'CPUExecutionProvider']
+        
+        print("Loading ONNX Model into VRAM via DirectX 12...")
+        try:
+            sess = ort.InferenceSession(cnn_model_path, providers=providers)
+            active_provider = sess.get_providers()[0]
+            if active_provider == 'DmlExecutionProvider':
+                print("[SUCCESS] RTX 3060Ti active and ready.")
+            else:
+                print(f"[WARNING] DirectML failed to load. Falling back to CPU ({active_provider}).")
+                
+            input_name = sess.get_inputs()[0].name
+            input_shape = sess.get_inputs()[0].shape
             
-        print("Model loaded. Generating structural masks...\n")
-        
-        for f in tqdm(target_files, desc="CNN Prediction"):
-            img_mtg = load_as_float(f)
-            if img_mtg is None or np.max(img_mtg) == 0: continue
-            img_clahe, _ = preprocess_image(img_mtg, tophat_radius)
-            cnn_masks_dict[f] = generate_cnn_mask_sequential(img_clahe, model, patch_h, patch_w, suppress_output=True)
+            # Handle dynamic shapes gracefully
+            patch_h = input_shape[1] if isinstance(input_shape[1], int) else 656
+            patch_w = input_shape[2] if isinstance(input_shape[2], int) else 656
+                
+            print(f"Model loaded. Generating structural masks with patch size ({patch_h}x{patch_w})...\n")
+            
+            for f in tqdm(target_files, desc="Processing Images"):
+                img_mtg = load_as_float(f)
+                if img_mtg is None or np.max(img_mtg) == 0: continue
+                img_clahe, _ = preprocess_image(img_mtg, tophat_radius)
+                
+                # Execute inference using ONNX
+                cnn_masks_dict[f] = generate_cnn_mask_sequential(img_clahe, sess, input_name, patch_h, patch_w, suppress_output=False)
 
-        print("--- Phase 1 Complete. Clearing Neural Engine... ---")
-        del model
-        K.clear_session()
-        gc.collect()
-        print("Neural engine purged.\n")
+            print("\n--- Phase 1 Complete. Releasing VRAM... ---")
+            del sess
+            gc.collect()
+            print("VRAM cleared.\n")
+            
+        except Exception as e:
+            print(f"\n[!] ERROR running ONNX model: {e}")
+            print("Ensure you have provided the correct .onnx file path.")
+            return
 
     print("\n--- Phase 2: Parallel Morphology & Extraction ---")
     tasks = []
@@ -760,7 +771,8 @@ if __name__ == "__main__":
     base_dir = r"C:/Users/Thomas/Desktop/Temp local/General NQO2 Search/Morphology"
     data_path= r"C:/Users/Thomas/Vandria/Superlab - 4 NQO2 Biology/Mitophagy/Microscopy/04 - TMRM & MitoTracker/TCH_003_TMRM_MTG_HepG2/Plate 3/AcquireOnly.V3_04-09-26_05;16;16"
     dtt_path = "C:/Users/Thomas/Vandria/Superlab - 4 NQO2 Biology/Mitophagy/Microscopy/04 - TMRM & MitoTracker/TCH_003_TMRM_MTG_HepG2/Plate 3/Drug treatment plate 3.tdd"
-    cnn_model_file = r"C:/Users/Thomas/Desktop/Temp local/General NQO2 Search/Morphology/MitoSegNet_model.hdf5"
+    
+    cnn_model_file = r"C:/Users/Thomas/Desktop/Temp local/General NQO2 Search/Morphology/MitoSegNet_model.onnx"
     
     out_dir, paths_dict = setup_output(base_dir, "Output Images plate 3", zero_pad=True)
     treatment_dictionary = parse_tecan_d300e_xml(dtt_path)
@@ -777,4 +789,3 @@ if __name__ == "__main__":
         save_qc_nuclei=True, save_qc_mtg=True, save_qc_tmrm=True, save_qc_composite=True, save_qc_cnn=True,
         plot_only=False, master_csv_path=existing_csv_path
     )
-
