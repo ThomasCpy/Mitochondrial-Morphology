@@ -3,6 +3,7 @@ __pycache__/
 *.py[codz]
 *$py.class
 *.hdf5
+*.onnx
 *.tdd
 # C extensions
 *.so
