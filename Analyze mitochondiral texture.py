@@ -3,6 +3,7 @@ import re
 import csv
 import glob
 import textwrap
+import tempfile
 import numpy as np
 import pandas as pd
 import seaborn as sns
@@ -368,7 +369,7 @@ def _worker_process_field(args):
     (file_path, well_id, field_id, output_paths_dict, target_channel, 
      tmrm_channel, nuclei_channel, sigma, tophat_radius, 
      use_watershed, cyto_expansion, mito_buffer, min_cyto, boundary_smoothing, mask_method, cnn_noise_filter_radius,
-     use_cnn, precomputed_mask,
+     use_cnn, precomputed_mask_path, # Changed to path string to prevent RAM explosions!
      save_qc_nuclei, save_qc_mtg, save_qc_tmrm, save_qc_composite, save_qc_cnn) = args
     
     well_out_dir = output_paths_dict.get(well_id)
@@ -391,8 +392,11 @@ def _worker_process_field(args):
         
     img_clahe, img_tophat = preprocess_image(img_mtg, tophat_radius)
     
-    if use_cnn and precomputed_mask is not None:
-        mask_mtg = precomputed_mask
+    if use_cnn and precomputed_mask_path is not None and os.path.exists(precomputed_mask_path):
+        # Load mask from disk to save RAM, then clean it up immediately
+        mask_mtg = np.load(precomputed_mask_path)
+        os.remove(precomputed_mask_path) 
+        
         if cnn_noise_filter_radius > 0:
             traditional_mask = get_mask(img_tophat, sigma=2.0, method=mask_method)
             selem = morphology.disk(cnn_noise_filter_radius)
@@ -517,29 +521,25 @@ def add_stat_annotation(ax, data, x_col, y_col, ref_cond):
             ax.text((ref_idx + i) / 2, current_y + step/3, stars, ha='center', va='bottom', color='k')
             current_y += step * 1.5
 
-def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv_path_override=None):
-    """saves single-cell morphological and potential data, plots continuous distribution curves, and boxplots"""
-    if csv_path_override and os.path.exists(csv_path_override):
-        df_cells = pd.read_csv(csv_path_override)
-        parent_out_dir = os.path.dirname(csv_path_override)
-        print(f"\nLoaded existing single-cell dataset from: {csv_path_override}")
-    else:
-        if not all_cell_data: return
-        
-        parent_out_dir = os.path.dirname(output_paths_dict[all_cell_data[0]["Well_ID"]])
-        csv_path = os.path.join(parent_out_dir, "Plate_SingleCell_Morphology_Data.csv")
-        
-        df_cells = pd.DataFrame(all_cell_data)
+def aggregate_and_plot_data(csv_path, treatment_map):
+    """loads highly-optimized CSV directly into pandas, plots continuous distribution curves, and boxplots"""
+    if not csv_path or not os.path.exists(csv_path):
+        print(f"Error: Could not find aggregated data at {csv_path}.")
+        return
+
+    parent_out_dir = os.path.dirname(csv_path)
+    print(f"\nLoading optimized dataset for plotting from: {csv_path}")
+    
+    # Load from disk instead of RAM to prevent array memory errors
+    df_cells = pd.read_csv(csv_path)
+    
+    # Map conditions directly on the dataframe
+    if 'Condition' not in df_cells.columns:
         df_cells['Condition'] = df_cells['Well_ID'].map(treatment_map).fillna("Untreated")
-        
-        meta_cols = ['Global_Cell_ID', 'Well_ID', 'Condition', 'Field', 'Local_Cell_ID', 'Cell_Area', 'Mito_Px', 'Mean_Morphology', 'Mean_TMRM_Intensity']
-        hist_cols = [c for c in df_cells.columns if c.startswith('Hist_Bin_')]
-        cols = meta_cols + hist_cols
-        df_cells = df_cells[cols]
-        
+        # Save condition column back to the master file
         df_cells.to_csv(csv_path, index=False)
-        print(f"\nExported single-cell master dataset to: {csv_path}")
-            
+        print("Mapped Tecan treatments and saved back to master CSV.")
+
     agg_funcs = {
         'Global_Cell_ID': 'count',
         'Cell_Area': 'median',
@@ -674,7 +674,7 @@ def process_plate_directory(
     if plot_only:
         print("\n--- phase: plotting only (skipping image extraction) ---")
         if master_csv_path and os.path.exists(master_csv_path):
-            aggregate_and_plot_data(None, None, None, csv_path_override=master_csv_path)
+            aggregate_and_plot_data(master_csv_path, treatment_map)
         else:
             print(f"error: plot_only is true but valid master_csv_path was not found at {master_csv_path}")
         return
@@ -720,12 +720,21 @@ def process_plate_directory(
             print(f"Model loaded. Generating structural masks with patch size ({patch_h}x{patch_w})...\n")
             
             for f in tqdm(target_files, desc="Processing Images"):
+                match = pattern.search(f)
+                well_id = match.group(1)
+                well_out_dir = output_paths_dict.get(well_id)
+
                 img_mtg = load_as_float(f)
                 if img_mtg is None or np.max(img_mtg) == 0: continue
                 img_clahe, _ = preprocess_image(img_mtg, tophat_radius)
                 
-                # Execute inference using ONNX
-                cnn_masks_dict[f] = generate_cnn_mask_sequential(img_clahe, sess, input_name, patch_h, patch_w, suppress_output=False)
+                # Suppressed output to True here so \r doesn't break tqdm bar formatting
+                mask = generate_cnn_mask_sequential(img_clahe, sess, input_name, patch_h, patch_w, suppress_output=True)
+                
+                # To prevent RAM exhaustion, save mask to disk and give the worker the file path.
+                temp_mask_path = os.path.join(well_out_dir, f"temp_cnn_mask_{os.path.basename(f)}.npy")
+                np.save(temp_mask_path, mask)
+                cnn_masks_dict[f] = temp_mask_path
 
             print("\n--- Phase 1 Complete. Releasing VRAM... ---")
             del sess
@@ -749,18 +758,33 @@ def process_plate_directory(
             save_qc_nuclei, save_qc_mtg, save_qc_tmrm, save_qc_composite, save_qc_cnn
         ))
 
-    all_cell_data = []
+    # Dynamically determine master CSV path and ensure it's empty
+    parent_out_dir = os.path.dirname(list(output_paths_dict.values())[0])
+    csv_path = master_csv_path or os.path.join(parent_out_dir, "Plate_SingleCell_Morphology_Data.csv")
+    if os.path.exists(csv_path):
+        os.remove(csv_path)
+
     max_workers = min(6, os.cpu_count() - 1, len(tasks)) if os.cpu_count() else 1
     
     print(f"Spawning {max_workers} isolated processes...")
+    first_write = True
     with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(_worker_process_field, t): t for t in tasks}
+        
         for future in tqdm(concurrent.futures.as_completed(futures), total=len(tasks), desc="Calculating Morphology"):
             res = future.result()
-            if res: all_cell_data.extend(res)
+            if res:
+                # Append directly to the CSV chunk-by-chunk to save massive amounts of RAM
+                df_chunk = pd.DataFrame(res)
+                df_chunk.to_csv(csv_path, mode='a', header=first_write, index=False)
+                first_write = False
+                
+                # Wipe from RAM
+                del res
+                del df_chunk
 
-    if all_cell_data:
-        aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map)
+    # Call aggregation directly from disk
+    aggregate_and_plot_data(csv_path, treatment_map)
 
 
 # ==========================================
