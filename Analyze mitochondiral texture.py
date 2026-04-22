@@ -124,8 +124,7 @@ def parse_tecan_d300e_xml(file_path):
 def load_as_float(image_path):
     """
     loads image and forces float for safe math operations.
-    CRITICAL FIX: Uses the bit-depth maximum (e.g. 65535) for scaling to preserve 
-    absolute intensity differences across different wells (important for TMRM).
+    Dynamically estimates true hardware bit-depth ceiling to prevent crushing low-exposure images.
     """
     if not os.path.exists(image_path):
         return None
@@ -134,17 +133,21 @@ def load_as_float(image_path):
     if np.max(img) == 0:
         return img.astype(np.float32)
         
-    # Safely scale based on hardware bit-depth
-    if img.dtype == np.uint8:
-        return img.astype(np.float32) / 255.0
-    elif img.dtype == np.uint16:
-        return img.astype(np.float32) / 65535.0
-    elif img.dtype not in [np.float64, np.float32]:
-        return img.astype(np.float32) / 65535.0
+    img_max = np.max(img)
+    
+    # Guess the true camera hardware limit based on the brightest pixel in this specific image
+    if img.dtype == np.uint8 or img_max <= 255:
+        scale_factor = 255.0
+    elif img_max <= 4095:       # 12-bit camera
+        scale_factor = 4095.0
+    elif img_max <= 16383:      # 14-bit camera
+        scale_factor = 16383.0
+    else:                       # 16-bit camera
+        scale_factor = 65535.0
         
-    return img
+    return img.astype(np.float32) / scale_factor
 
-def segment_nuclei(img, min_nucleus_area=500, use_watershed=False, method='otsu'):
+def segment_nuclei(img, min_nucleus_area=500, use_watershed=False, method='triangle'):
     """handles hoechst segmentation to find nuclei markers"""
     if img is None or np.max(img) == 0: 
         return None, 0
@@ -584,7 +587,7 @@ def add_stat_annotation(ax, data, x_col, y_col, ref_cond):
             ax.text((ref_idx + i) / 2, current_y + step/3, stars, ha='center', va='bottom', color='k')
             current_y += step * 1.5
 
-def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv_path_override=None, tmrm_max_range=0.25):
+def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv_path_override=None, tmrm_max_range=0.25, plot_as_density=True):
     """saves single-cell morphological and potential data, plots continuous distribution curves, and boxplots"""
     if csv_path_override and os.path.exists(csv_path_override):
         df_cells = pd.read_csv(csv_path_override)
@@ -631,6 +634,10 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
     ref_cond = "Vehicle" if "Vehicle" in conditions else conditions[0]
     sns.set_style("whitegrid")
     
+    # Dictionaries to store mean distributions for EMD calculation
+    morph_dists = {}
+    tmrm_dists = {}
+    
     # ----------------------------------------------------
     # 1. Plot Continuous Morphology Distributions
     # ----------------------------------------------------
@@ -646,31 +653,38 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
         for _, row in cond_data.iterrows():
             if row['Cell_Count'] > 0:
                 hist_vals = np.array([row.get(f'Hist_Bin_{b:02d}', 0) for b in range(1, 21)])
-                norm_hists.append(hist_vals / row['Cell_Count'])
+                
+                if plot_as_density:
+                    total_mito_px = np.sum(hist_vals)
+                    if total_mito_px > 0:
+                        norm_hists.append(hist_vals / total_mito_px) # Fraction of Network
+                else:
+                    norm_hists.append(hist_vals / row['Cell_Count']) # Absolute Pixels per Cell
                 
         if norm_hists:
             norm_hists = np.array(norm_hists)
             mean_hist = np.mean(norm_hists, axis=0)
             sem_hist = stats.sem(norm_hists, axis=0) if len(norm_hists) > 1 else np.zeros_like(mean_hist)
             
+            morph_dists[cond] = mean_hist # Store for EMD calculation
+            
             line, = ax_dist.plot(bin_centers_morph, mean_hist, label=cond, color=colors[i], lw=2)
             ax_dist.fill_between(bin_centers_morph, mean_hist - sem_hist, mean_hist + sem_hist, alpha=0.2, color=colors[i])
 
     ax_dist.set_title("Continuous Mitochondrial Tubularness Distribution", fontsize=14, fontweight='bold')
     ax_dist.set_xlabel("Tubularness Index (0=Spotty, 1=Tubular)")
-    ax_dist.set_ylabel("Average Pixel Area per Cell")
+    ax_dist.set_ylabel("Fraction of Mitochondrial Network" if plot_as_density else "Average Pixel Area per Cell")
     ax_dist.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
     plt.tight_layout()
     plt.savefig(os.path.join(parent_out_dir, "Condition_Morphology_Distribution.png"), dpi=300, bbox_inches='tight')
     plt.close(fig_dist)
 
     # ----------------------------------------------------
-    # 2. Plot Continuous TMRM Distributions (NEW)
+    # 2. Plot Continuous TMRM Distributions
     # ----------------------------------------------------
     if f'TMRM_Hist_Bin_01' in well_df.columns:
         fig_tmrm, ax_tmrm = plt.subplots(figsize=(10, 6))
         
-        # Calculate centers based on the range used during extraction
         bin_centers_tmrm = np.linspace(tmrm_max_range/100, tmrm_max_range - tmrm_max_range/100, 50) 
         max_meaningful_idx = 0
         
@@ -682,12 +696,20 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
             for _, row in cond_data.iterrows():
                 if row['Cell_Count'] > 0:
                     hist_vals_tmrm = np.array([row.get(f'TMRM_Hist_Bin_{b:02d}', 0) for b in range(1, 51)])
-                    norm_hists_tmrm.append(hist_vals_tmrm / row['Cell_Count'])
+                    
+                    if plot_as_density:
+                        total_tmrm_px = np.sum(hist_vals_tmrm)
+                        if total_tmrm_px > 0:
+                            norm_hists_tmrm.append(hist_vals_tmrm / total_tmrm_px)
+                    else:
+                        norm_hists_tmrm.append(hist_vals_tmrm / row['Cell_Count'])
                     
             if norm_hists_tmrm:
                 norm_hists_tmrm = np.array(norm_hists_tmrm)
                 mean_hist_tmrm = np.mean(norm_hists_tmrm, axis=0)
                 sem_hist_tmrm = stats.sem(norm_hists_tmrm, axis=0) if len(norm_hists_tmrm) > 1 else np.zeros_like(mean_hist_tmrm)
+                
+                tmrm_dists[cond] = mean_hist_tmrm # Store for EMD calculation
                 
                 line, = ax_tmrm.plot(bin_centers_tmrm, mean_hist_tmrm, label=cond, color=colors[i], lw=2)
                 ax_tmrm.fill_between(bin_centers_tmrm, mean_hist_tmrm - sem_hist_tmrm, mean_hist_tmrm + sem_hist_tmrm, alpha=0.2, color=colors[i])
@@ -701,7 +723,7 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
 
         ax_tmrm.set_title("Continuous TMRM Membrane Potential Distribution", fontsize=14, fontweight='bold')
         ax_tmrm.set_xlabel(f"Relative TMRM Pixel Intensity (0.0 to {tmrm_max_range})")
-        ax_tmrm.set_ylabel("Average Pixel Area per Cell")
+        ax_tmrm.set_ylabel("Fraction of Mitochondrial Network" if plot_as_density else "Average Pixel Area per Cell")
         
         # Crop the X-axis dynamically to remove dead space, padding by 3 bins
         plot_max_idx = min(49, max_meaningful_idx + 3)
@@ -711,6 +733,41 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
         plt.tight_layout()
         plt.savefig(os.path.join(parent_out_dir, "Condition_TMRM_Distribution.png"), dpi=300, bbox_inches='tight')
         plt.close(fig_tmrm)
+
+    # ----------------------------------------------------
+    # 2.5 Calculate Earth Mover's Distance (EMD)
+    # ----------------------------------------------------
+    emd_records = []
+    if ref_cond in morph_dists:
+        ref_morph = morph_dists[ref_cond]
+        ref_tmrm = tmrm_dists.get(ref_cond)
+        
+        for cond in conditions:
+            if cond == ref_cond: continue
+            
+            record = {
+                "Condition": cond, 
+                "Reference_Control": ref_cond
+            }
+            
+            if cond in morph_dists:
+                # EMD requires the bin locations and their respective weights (probabilities)
+                emd_m = stats.wasserstein_distance(bin_centers_morph, bin_centers_morph, 
+                                                   u_weights=ref_morph, v_weights=morph_dists[cond])
+                record["EMD_Morphology_Shift"] = emd_m
+                
+            if ref_tmrm is not None and cond in tmrm_dists:
+                emd_t = stats.wasserstein_distance(bin_centers_tmrm, bin_centers_tmrm, 
+                                                   u_weights=ref_tmrm, v_weights=tmrm_dists[cond])
+                record["EMD_TMRM_Shift"] = emd_t
+                
+            emd_records.append(record)
+            
+    if emd_records:
+        df_emd = pd.DataFrame(emd_records).sort_values(by="EMD_TMRM_Shift" if "EMD_TMRM_Shift" in emd_records[0] else "Condition", ascending=False)
+        emd_csv_path = os.path.join(parent_out_dir, "Distribution_EMD_Statistics.csv")
+        df_emd.to_csv(emd_csv_path, index=False)
+        print(f"\nExported Earth Mover's Distance (Wasserstein) statistics to: {emd_csv_path}")
 
     # ----------------------------------------------------
     # 3. Boxplot Analytics 
@@ -792,14 +849,14 @@ def process_plate_directory(
     sigma=1.0, tophat_radius=5, test_well=None,
     use_watershed=False, nuclei_mask_method='triangle', cyto_expansion=80, mito_buffer=20, min_cyto=20, boundary_smoothing=3,
     mask_method='triangle', cnn_noise_filter_radius=25,
-    use_cnn=False, cnn_model_path=None, tmrm_max_range=0.25,
+    use_cnn=False, cnn_model_path=None, tmrm_max_range=0.25, plot_as_density=True,
     save_qc_nuclei=True, save_qc_mtg=True, save_qc_tmrm=True, save_qc_composite=True, save_qc_cnn=True,
     plot_only=False, master_csv_path=None
 ):
     if plot_only:
         if master_csv_path and os.path.exists(master_csv_path):
             print("\n--- phase: plotting only (skipping image extraction) ---")
-            aggregate_and_plot_data(None, None, None, csv_path_override=master_csv_path, tmrm_max_range=tmrm_max_range)
+            aggregate_and_plot_data(None, None, None, csv_path_override=master_csv_path, tmrm_max_range=tmrm_max_range, plot_as_density=plot_as_density)
             return
         else:
             print(f"\n[!] Notice: plot_only is True, but no existing dataset was found at: {master_csv_path}")
@@ -887,7 +944,7 @@ def process_plate_directory(
             if res: all_cell_data.extend(res)
 
     if all_cell_data:
-        aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, tmrm_max_range=tmrm_max_range)
+        aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, tmrm_max_range=tmrm_max_range, plot_as_density=plot_as_density)
 
 
 # ==========================================
@@ -912,7 +969,7 @@ if __name__ == "__main__":
         use_cnn=True, cnn_model_path=cnn_model_file,
         sigma=1.0, tophat_radius=6, test_well=None,
         use_watershed=True, nuclei_mask_method='triangle', cyto_expansion=80, mito_buffer=20, min_cyto=20, boundary_smoothing=3,
-        mask_method='triangle', cnn_noise_filter_radius=10, tmrm_max_range=0.25,
+        mask_method='triangle', cnn_noise_filter_radius=10, tmrm_max_range=0.25, plot_as_density=True,
         save_qc_nuclei=True, save_qc_mtg=True, save_qc_tmrm=True, save_qc_composite=True, save_qc_cnn=True,
         plot_only=False, master_csv_path=existing_csv_path
     )
