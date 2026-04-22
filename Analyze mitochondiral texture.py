@@ -164,7 +164,7 @@ def segment_nuclei(img, min_nucleus_area=500, use_watershed=False, method='otsu'
     
     if use_watershed:
         distance = ndi.distance_transform_edt(mask_cleaned)
-        coords = feature.peak_local_max(distance, min_distance=7, labels=mask_cleaned)
+        coords = feature.peak_local_max(distance, min_distance=20, labels=mask_cleaned)
         marker_mask = np.zeros(distance.shape, dtype=bool)
         marker_mask[tuple(coords.T)] = True
         markers, _ = ndi.label(marker_mask)
@@ -205,10 +205,22 @@ def define_cell_territories(img_hoechst, nuclei_labels, mask_mtg, out_folder, ba
     cell_labels = segmentation.watershed(topography, nuclei_labels, mask=flood_mask)
     
     if save_qc and out_folder is not None:
-        bound_img = segmentation.mark_boundaries(img_hoechst, cell_labels, color=(1, 0, 0), mode='thin')
         fig, axes = plt.subplots(1, 2, figsize=(12, 6))
         axes[0].imshow(img_hoechst, cmap='gray'); axes[0].set_title('original hoechst'); axes[0].axis('off')
-        axes[1].imshow(bound_img); axes[1].set_title(f'organic cell zones ({np.max(nuclei_labels)})'); axes[1].axis('off')
+        
+        axes[1].imshow(img_hoechst, cmap='gray')
+        # Overlay nuclei in transparent blue
+        blue_rgba = np.zeros((*img_hoechst.shape, 4), dtype=np.uint8)
+        blue_rgba[nuclei_labels > 0] = [0, 0, 255, int(0.5 * 255)]
+        axes[1].imshow(blue_rgba)
+        
+        # Overlay cell boundaries in solid red
+        boundaries = segmentation.find_boundaries(cell_labels, mode='inner')
+        bound_rgba = np.zeros((*img_hoechst.shape, 4), dtype=np.uint8)
+        bound_rgba[boundaries] = [255, 0, 0, 255]
+        axes[1].imshow(bound_rgba)
+        
+        axes[1].set_title(f'organic cell zones ({np.max(nuclei_labels)})'); axes[1].axis('off')
         plt.tight_layout()
         plt.savefig(os.path.join(out_folder, f"{base_name}_cell_zones_QC.png"), dpi=300, bbox_inches='tight')
         fig.clf()
@@ -317,12 +329,20 @@ def save_tmrm_mtg_overlay_qc(img_tmrm, mask_mtg, out_folder, base_name):
     fig.clf()
     plt.close('all')
 
-def save_master_overlay_qc(img_base, mask_hoechst, mask_mtg, cell_labels, out_folder, base_name):
+def save_master_overlay_qc(img_base, mask_hoechst, mask_mtg, cell_labels, img_tmrm, out_folder, base_name):
     """combines all structural boundaries into a single rational composite qc"""
     fig, ax = plt.subplots(figsize=(10, 10))
     ax.imshow(img_base, cmap='gray')
     
     # memory fix: force uint8 arrays. float64 arrays of 2843x2843x4 take exactly 247 MiB of RAM each!
+    if img_tmrm is not None:
+        # Scale TMRM intensity visually for the red transparent overlay
+        tmrm_norm = img_tmrm / (np.max(img_tmrm) + 1e-8)
+        red_rgba = np.zeros((*img_base.shape, 4), dtype=np.uint8)
+        red_rgba[..., 0] = 255 # Pure red
+        red_rgba[..., 3] = (tmrm_norm * 0.5 * 255).astype(np.uint8) # Opacity scales with TMRM intensity
+        ax.imshow(red_rgba)
+        
     if mask_hoechst is not None:
         blue_rgba = np.zeros((*img_base.shape, 4), dtype=np.uint8)
         blue_rgba[mask_hoechst] = [0, 0, 255, int(0.4 * 255)]
@@ -334,11 +354,11 @@ def save_master_overlay_qc(img_base, mask_hoechst, mask_mtg, cell_labels, out_fo
     if cell_labels is not None:
         boundaries = segmentation.find_boundaries(cell_labels, mode='inner')
         bound_rgba = np.zeros((*img_base.shape, 4), dtype=np.uint8)
-        bound_rgba[boundaries] = [255, 0, 0, 255] 
+        bound_rgba[boundaries] = [255, 255, 255, 255] # Changed to solid White to contrast with red TMRM
         ax.imshow(bound_rgba)
         
     ax.axis('off')
-    ax.set_title('Composite: Blue=Nuclei, Green=MTG, Red=Cell Bounds')
+    ax.set_title('Composite: Blue=Nuclei, Green=MTG, Red=TMRM, White=Cell Bounds')
     plt.tight_layout()
     plt.savefig(os.path.join(out_folder, f"{base_name}_master_composite_QC.png"), dpi=300, bbox_inches='tight')
     fig.clf()
@@ -474,7 +494,7 @@ def _worker_process_field(args):
     if save_qc_composite and mask_hoechst is not None and mask_mtg is not None:
         qc_comp_dir = os.path.join(well_out_dir, "Master Composite")
         os.makedirs(qc_comp_dir, exist_ok=True)
-        save_master_overlay_qc(img_clahe, mask_hoechst, mask_mtg, cell_labels, qc_comp_dir, base_filename)
+        save_master_overlay_qc(img_clahe, mask_hoechst, mask_mtg, cell_labels, img_tmrm, qc_comp_dir, base_filename)
 
     # 7. Single Cell Extraction (Histograms & Means)
     cell_records = []
