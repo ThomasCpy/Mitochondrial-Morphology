@@ -808,7 +808,7 @@ def process_plate_directory(
         ))
 
     all_cell_data = []
-    max_workers = min(6, os.cpu_count() - 1, len(tasks)) if os.cpu_count() else 1
+    max_workers = min(os.cpu_count() - 1, len(tasks)) if os.cpu_count() else 1
     
     print(f"Spawning {max_workers} isolated processes...")
     with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
