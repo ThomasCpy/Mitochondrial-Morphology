@@ -167,7 +167,7 @@ def segment_nuclei(img, min_nucleus_area=500, use_watershed=False, method='trian
     
     if use_watershed:
         distance = ndi.distance_transform_edt(mask_cleaned)
-        coords = feature.peak_local_max(distance, min_distance=20, labels=mask_cleaned)
+        coords = feature.peak_local_max(distance, min_distance=15, labels=mask_cleaned)
         marker_mask = np.zeros(distance.shape, dtype=bool)
         marker_mask[tuple(coords.T)] = True
         markers, _ = ndi.label(marker_mask)
@@ -428,7 +428,7 @@ def _worker_process_field(args):
     (file_path, well_id, field_id, output_paths_dict, target_channel, 
      tmrm_channel, nuclei_channel, sigma, tophat_radius, 
      use_watershed, nuclei_mask_method, cyto_expansion, mito_buffer, min_cyto, boundary_smoothing, mask_method, cnn_noise_filter_radius,
-     use_cnn, precomputed_mask, tmrm_max_range,
+     use_cnn, precomputed_mask, tmrm_max_range, tmrm_threshold,
      save_qc_nuclei, save_qc_mtg, save_qc_tmrm, save_qc_composite, save_qc_cnn) = args
     
     well_out_dir = output_paths_dict.get(well_id)
@@ -505,6 +505,10 @@ def _worker_process_field(args):
         props_cells = measure.regionprops(cell_labels)
         area_dict = {p.label: p.area for p in props_cells}
         
+        # Get Nuclear Areas (nuclei_labels share exact IDs with cell_labels via watershed map)
+        props_nuc = measure.regionprops(nuclei_labels)
+        nuc_area_dict = {p.label: p.area for p in props_nuc}
+        
         # Mask out non-mito pixels so regionprops only looks at structural networks
         mtg_labels = cell_labels * mask_mtg
         props_morph = measure.regionprops(mtg_labels, intensity_image=smoothed_index)
@@ -513,6 +517,16 @@ def _worker_process_field(args):
         if img_tmrm is not None:
             props_tmrm = measure.regionprops(mtg_labels, intensity_image=img_tmrm)
             tmrm_dict = {p.label: p.intensity_image[p.image] for p in props_tmrm}
+            
+        mtg_raw_dict = {}
+        if img_mtg is not None:
+            props_mtg_raw = measure.regionprops(mtg_labels, intensity_image=img_mtg)
+            mtg_raw_dict = {p.label: p.intensity_image[p.image] for p in props_mtg_raw}
+            
+        # Bin Configurations
+        mtg_bin_size = 1.0 / 20.0
+        tmrm_bin_size = tmrm_max_range / 20.0
+        morph_bin_size = 1.0 / 20.0
         
         for prop in props_morph:
             c_id = prop.label
@@ -520,39 +534,50 @@ def _worker_process_field(args):
             
             if len(morph_vals) == 0: continue
             
-            # create 20 bins capturing 0.0 to 1.0 distribution for Morphology
-            hist_morph, _ = np.histogram(morph_vals, bins=20, range=(0.0, 1.0))
-            mean_morph = np.mean(morph_vals)
             mtg_px = len(morph_vals)
+            mean_morph = np.mean(morph_vals)
+            mean_spottiness = 1.0 - mean_morph
             
-            # extract TMRM data and create 50 intensity bins
-            t_vals = tmrm_dict.get(c_id, [])
-            mean_tmrm = np.mean(t_vals) if len(t_vals) > 0 else 0.0
+            # Tubularness Bins
+            hist_morph, _ = np.histogram(morph_vals, bins=20, range=(0.0, 1.0))
             
-            # Create a 50-bin histogram for TMRM intensity from 0.0 to tmrm_max_range
+            # TMRM processing and Overlap
+            t_vals = tmrm_dict.get(c_id, np.array([]))
             if len(t_vals) > 0:
-                hist_tmrm, _ = np.histogram(t_vals, bins=50, range=(0.0, tmrm_max_range))
+                hist_tmrm, _ = np.histogram(t_vals, bins=20, range=(0.0, tmrm_max_range))
+                overlap_pct = np.mean(t_vals > tmrm_threshold) * 100.0
             else:
-                hist_tmrm = np.zeros(50)
+                hist_tmrm = np.zeros(20)
+                overlap_pct = 0.0
+                
+            # MTG Raw processing
+            m_raw_vals = mtg_raw_dict.get(c_id, np.array([]))
+            if len(m_raw_vals) > 0:
+                hist_mtg, _ = np.histogram(m_raw_vals, bins=20, range=(0.0, 1.0))
+            else:
+                hist_mtg = np.zeros(20)
             
             global_id = f"{well_id}_f{field_id}_c{c_id}"
             
             record = {
-                "Global_Cell_ID": global_id,
-                "Well_ID": well_id, 
+                "UID": global_id,
+                "Well": well_id, 
                 "Field": field_id, 
+                "Treatment": "Unknown", # Added in aggregate function
                 "Local_Cell_ID": c_id,
-                "Cell_Area": area_dict.get(c_id, 0),
-                "Mito_Px": mtg_px,
-                "Mean_Morphology": mean_morph,
-                "Mean_TMRM_Intensity": mean_tmrm
+                "Area": area_dict.get(c_id, 0),
+                "Nuclear_Area": nuc_area_dict.get(c_id, 0),
+                "Total_MTG_Pixels": mtg_px,
+                "TMRM_Above_Threshold_Pct": overlap_pct,
+                "Mean_Tubularness": mean_morph,
+                "Mean_Spottiness": mean_spottiness
             }
             
             for b in range(20):
-                record[f"Hist_Bin_{b+1:02d}"] = hist_morph[b]
-                
-            for b in range(50):
-                record[f"TMRM_Hist_Bin_{b+1:02d}"] = hist_tmrm[b]
+                # Bin names dynamically reflecting the requested sizes
+                record[f"Tubularness_Bin_Size_{morph_bin_size:.2f}_Idx_{b+1:02d}"] = hist_morph[b]
+                record[f"MTG_RawInt_Bin_Size_{mtg_bin_size:.2f}_Idx_{b+1:02d}"] = hist_mtg[b]
+                record[f"TMRM_RawInt_Bin_Size_{tmrm_bin_size:.3f}_Idx_{b+1:02d}"] = hist_tmrm[b]
                 
             cell_records.append(record)
 
@@ -588,259 +613,114 @@ def add_stat_annotation(ax, data, x_col, y_col, ref_cond):
             current_y += step * 1.5
 
 def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv_path_override=None, tmrm_max_range=0.25, plot_as_density=True):
-    """saves single-cell morphological and potential data, plots continuous distribution curves, and boxplots"""
+    """saves single-cell data, runs UMAP and Boxplots as requested"""
     if csv_path_override and os.path.exists(csv_path_override):
         df_cells = pd.read_csv(csv_path_override)
         parent_out_dir = os.path.dirname(csv_path_override)
         print(f"\nLoaded existing single-cell dataset from: {csv_path_override}")
     else:
         if not all_cell_data: return
-        
-        parent_out_dir = os.path.dirname(output_paths_dict[all_cell_data[0]["Well_ID"]])
-        csv_path = os.path.join(parent_out_dir, "Plate_SingleCell_Morphology_Data.csv")
+        parent_out_dir = os.path.dirname(output_paths_dict[all_cell_data[0]["Well"]])
         
         df_cells = pd.DataFrame(all_cell_data)
-        df_cells['Condition'] = df_cells['Well_ID'].map(treatment_map).fillna("Untreated")
+        # Map treatments
+        df_cells['Treatment'] = df_cells['Well'].map(treatment_map).fillna("Untreated")
         
-        meta_cols = ['Global_Cell_ID', 'Well_ID', 'Condition', 'Field', 'Local_Cell_ID', 'Cell_Area', 'Mito_Px', 'Mean_Morphology', 'Mean_TMRM_Intensity']
-        morph_hist_cols = [f'Hist_Bin_{b:02d}' for b in range(1, 21)]
-        tmrm_hist_cols = [f'TMRM_Hist_Bin_{b:02d}' for b in range(1, 51)]
-        
-        # safely handle older CSVs without TMRM bins
-        all_cols = meta_cols + morph_hist_cols + tmrm_hist_cols
-        cols = [c for c in all_cols if c in df_cells.columns]
-        
+        csv_path = os.path.join(parent_out_dir, "Single_Cell_Properties.csv")
+        # Ensure ID columns are at the front
+        cols = ['UID', 'Well', 'Field', 'Treatment'] + [c for c in df_cells.columns if c not in ['UID', 'Well', 'Field', 'Treatment']]
         df_cells = df_cells[cols]
+        
         df_cells.to_csv(csv_path, index=False)
         print(f"\nExported single-cell master dataset to: {csv_path}")
-            
-    agg_funcs = {
-        'Global_Cell_ID': 'count',
-        'Cell_Area': 'median',
-        'Mean_Morphology': 'median',
-        'Mean_TMRM_Intensity': 'median'
-    }
-    for b in range(1, 21):
-        if f'Hist_Bin_{b:02d}' in df_cells.columns:
-            agg_funcs[f'Hist_Bin_{b:02d}'] = 'sum'
-            
-    for b in range(1, 51):
-        if f'TMRM_Hist_Bin_{b:02d}' in df_cells.columns:
-            agg_funcs[f'TMRM_Hist_Bin_{b:02d}'] = 'sum'
-            
-    well_df = df_cells.groupby(['Well_ID', 'Condition']).agg(agg_funcs).rename(columns={'Global_Cell_ID': 'Cell_Count'}).reset_index()
-    
-    conditions = sorted(well_df['Condition'].unique())
-    ref_cond = "Vehicle" if "Vehicle" in conditions else conditions[0]
+
+    # Plotting starts from zero
     sns.set_style("whitegrid")
-    
-    # Dictionaries to store mean distributions for EMD calculation
-    morph_dists = {}
-    tmrm_dists = {}
+    conditions = sorted(df_cells['Treatment'].unique())
+    ref_cond = "Vehicle" if "Vehicle" in conditions else conditions[0]
     
     # ----------------------------------------------------
-    # 1. Plot Continuous Morphology Distributions
+    # 1. Boxplot Analytics (Aggregated per Well)
     # ----------------------------------------------------
-    fig_dist, ax_dist = plt.subplots(figsize=(10, 6))
-    bin_centers_morph = np.linspace(0.025, 0.975, 20)
-    colors = sns.color_palette("husl", len(conditions))
-    
-    for i, cond in enumerate(conditions):
-        cond_data = well_df[well_df['Condition'] == cond]
-        if cond_data.empty: continue
-        
-        norm_hists = []
-        for _, row in cond_data.iterrows():
-            if row['Cell_Count'] > 0:
-                hist_vals = np.array([row.get(f'Hist_Bin_{b:02d}', 0) for b in range(1, 21)])
-                
-                if plot_as_density:
-                    total_mito_px = np.sum(hist_vals)
-                    if total_mito_px > 0:
-                        norm_hists.append(hist_vals / total_mito_px) # Fraction of Network
-                else:
-                    norm_hists.append(hist_vals / row['Cell_Count']) # Absolute Pixels per Cell
-                
-        if norm_hists:
-            norm_hists = np.array(norm_hists)
-            mean_hist = np.mean(norm_hists, axis=0)
-            sem_hist = stats.sem(norm_hists, axis=0) if len(norm_hists) > 1 else np.zeros_like(mean_hist)
-            
-            morph_dists[cond] = mean_hist # Store for EMD calculation
-            
-            line, = ax_dist.plot(bin_centers_morph, mean_hist, label=cond, color=colors[i], lw=2)
-            ax_dist.fill_between(bin_centers_morph, mean_hist - sem_hist, mean_hist + sem_hist, alpha=0.2, color=colors[i])
+    # Calculate requested specific medians and means per well
+    well_df = df_cells.groupby(['Well', 'Treatment']).agg(
+        Median_Tubularness=('Mean_Tubularness', 'median'),
+        Median_Spottiness=('Mean_Spottiness', 'median'),
+        Average_Cell_Size=('Area', 'mean')
+    ).reset_index()
 
-    ax_dist.set_title("Continuous Mitochondrial Tubularness Distribution", fontsize=14, fontweight='bold')
-    ax_dist.set_xlabel("Tubularness Index (0=Spotty, 1=Tubular)")
-    ax_dist.set_ylabel("Fraction of Mitochondrial Network" if plot_as_density else "Average Pixel Area per Cell")
-    ax_dist.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-    plt.tight_layout()
-    plt.savefig(os.path.join(parent_out_dir, "Condition_Morphology_Distribution.png"), dpi=300, bbox_inches='tight')
-    plt.close(fig_dist)
-
-    # ----------------------------------------------------
-    # 2. Plot Continuous TMRM Distributions
-    # ----------------------------------------------------
-    if f'TMRM_Hist_Bin_01' in well_df.columns:
-        fig_tmrm, ax_tmrm = plt.subplots(figsize=(10, 6))
-        
-        bin_centers_tmrm = np.linspace(tmrm_max_range/100, tmrm_max_range - tmrm_max_range/100, 50) 
-        max_meaningful_idx = 0
-        
-        for i, cond in enumerate(conditions):
-            cond_data = well_df[well_df['Condition'] == cond]
-            if cond_data.empty: continue
-            
-            norm_hists_tmrm = []
-            for _, row in cond_data.iterrows():
-                if row['Cell_Count'] > 0:
-                    hist_vals_tmrm = np.array([row.get(f'TMRM_Hist_Bin_{b:02d}', 0) for b in range(1, 51)])
-                    
-                    if plot_as_density:
-                        total_tmrm_px = np.sum(hist_vals_tmrm)
-                        if total_tmrm_px > 0:
-                            norm_hists_tmrm.append(hist_vals_tmrm / total_tmrm_px)
-                    else:
-                        norm_hists_tmrm.append(hist_vals_tmrm / row['Cell_Count'])
-                    
-            if norm_hists_tmrm:
-                norm_hists_tmrm = np.array(norm_hists_tmrm)
-                mean_hist_tmrm = np.mean(norm_hists_tmrm, axis=0)
-                sem_hist_tmrm = stats.sem(norm_hists_tmrm, axis=0) if len(norm_hists_tmrm) > 1 else np.zeros_like(mean_hist_tmrm)
-                
-                tmrm_dists[cond] = mean_hist_tmrm # Store for EMD calculation
-                
-                line, = ax_tmrm.plot(bin_centers_tmrm, mean_hist_tmrm, label=cond, color=colors[i], lw=2)
-                ax_tmrm.fill_between(bin_centers_tmrm, mean_hist_tmrm - sem_hist_tmrm, mean_hist_tmrm + sem_hist_tmrm, alpha=0.2, color=colors[i])
-                
-                # Find the highest bin index where signal is > 1% of this condition's peak
-                peak = np.max(mean_hist_tmrm)
-                if peak > 0:
-                    active_bins = np.where(mean_hist_tmrm > (peak * 0.01))[0]
-                    if len(active_bins) > 0:
-                        max_meaningful_idx = max(max_meaningful_idx, active_bins[-1])
-
-        ax_tmrm.set_title("Continuous TMRM Membrane Potential Distribution", fontsize=14, fontweight='bold')
-        ax_tmrm.set_xlabel(f"Relative TMRM Pixel Intensity (0.0 to {tmrm_max_range})")
-        ax_tmrm.set_ylabel("Fraction of Mitochondrial Network" if plot_as_density else "Average Pixel Area per Cell")
-        
-        # Crop the X-axis dynamically to remove dead space, padding by 3 bins
-        plot_max_idx = min(49, max_meaningful_idx + 3)
-        ax_tmrm.set_xlim(0, bin_centers_tmrm[plot_max_idx])
-        
-        ax_tmrm.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-        plt.tight_layout()
-        plt.savefig(os.path.join(parent_out_dir, "Condition_TMRM_Distribution.png"), dpi=300, bbox_inches='tight')
-        plt.close(fig_tmrm)
-
-    # ----------------------------------------------------
-    # 2.5 Calculate Earth Mover's Distance (EMD)
-    # ----------------------------------------------------
-    emd_records = []
-    if ref_cond in morph_dists:
-        ref_morph = morph_dists[ref_cond]
-        ref_tmrm = tmrm_dists.get(ref_cond)
-        
-        for cond in conditions:
-            if cond == ref_cond: continue
-            
-            record = {
-                "Condition": cond, 
-                "Reference_Control": ref_cond
-            }
-            
-            if cond in morph_dists:
-                # EMD requires the bin locations and their respective weights (probabilities)
-                emd_m = stats.wasserstein_distance(bin_centers_morph, bin_centers_morph, 
-                                                   u_weights=ref_morph, v_weights=morph_dists[cond])
-                record["EMD_Morphology_Shift"] = emd_m
-                
-            if ref_tmrm is not None and cond in tmrm_dists:
-                emd_t = stats.wasserstein_distance(bin_centers_tmrm, bin_centers_tmrm, 
-                                                   u_weights=ref_tmrm, v_weights=tmrm_dists[cond])
-                record["EMD_TMRM_Shift"] = emd_t
-                
-            emd_records.append(record)
-            
-    if emd_records:
-        df_emd = pd.DataFrame(emd_records).sort_values(by="EMD_TMRM_Shift" if "EMD_TMRM_Shift" in emd_records[0] else "Condition", ascending=False)
-        emd_csv_path = os.path.join(parent_out_dir, "Distribution_EMD_Statistics.csv")
-        df_emd.to_csv(emd_csv_path, index=False)
-        print(f"\nExported Earth Mover's Distance (Wasserstein) statistics to: {emd_csv_path}")
-
-    # ----------------------------------------------------
-    # 3. Boxplot Analytics 
-    # ----------------------------------------------------
     metrics = [
-        ('Cell_Count', 'Total Cells per Well', 'grey'),
-        ('Cell_Area', 'Cell Area (Px)', 'brown'),
-        ('Mean_Morphology', 'Mean Tubularness Index per Well', '#0072B2'),
-        ('Mean_TMRM_Intensity', 'Mean TMRM Intensity per Well', 'purple')
+        ('Median_Tubularness', 'Median Tubularness per Well', '#0072B2'),
+        ('Median_Spottiness', 'Median Spottiness per Well', 'orange'),
+        ('Average_Cell_Size', 'Average Cell Size (px) per Well', 'brown')
     ]
     
-    outlier_log_path = os.path.join(parent_out_dir, "Analysis_Outliers.txt")
-    with open(outlier_log_path, "w") as outlier_log:
-        outlier_log.write("Identification of statistical outliers (1.5 * iqr)\n")
-        outlier_log.write("="*60 + "\n")
+    for col, title, color in metrics:
+        fig, ax = plt.subplots(figsize=(8, 6))
         
-        for col, title, color in metrics:
-            if col not in well_df.columns: continue
-            
-            fig, ax = plt.subplots(figsize=(8, 6))
-            outlier_log.write(f"\n--- {title} ({col}) ---\n")
-            outliers_found_for_metric = False
-            non_outlier_indices = []
-            
-            for cond in conditions:
-                cond_data = well_df[well_df['Condition'] == cond]
-                if len(cond_data) < 3:
-                    non_outlier_indices.extend(cond_data.index)
-                    continue
-                
-                q1, q3 = np.percentile(cond_data[col].dropna(), [25, 75])
-                iqr = q3 - q1
-                lower_bound = q1 - 1.5 * iqr
-                upper_bound = q3 + 1.5 * iqr
-                
-                outliers = cond_data[(cond_data[col] < lower_bound) | (cond_data[col] > upper_bound)]
-                normals = cond_data[(cond_data[col] >= lower_bound) & (cond_data[col] <= upper_bound)]
-                
-                if not outliers.empty:
-                    outliers_found_for_metric = True
-                    outlier_log.write(f"  > {cond}:\n")
-                    for _, row in outliers.iterrows():
-                        outlier_log.write(f"     well {row['Well_ID']} - value: {row[col]:.3f}\n")
-                        
-                non_outlier_indices.extend(normals.index)
-                
-            if not outliers_found_for_metric:
-                outlier_log.write("  > no outliers detected.\n")
-                
-            df_normals = well_df.loc[non_outlier_indices]
-            
-            flierprops = dict(marker='o', markerfacecolor='none', markeredgecolor='black', markersize=7, alpha=0.8)
-            sns.boxplot(data=well_df, x='Condition', y=col, ax=ax, color=color, showfliers=True, flierprops=flierprops, width=0.5, boxprops=dict(alpha=0.6))
-            
-            if not df_normals.empty:
-                sns.stripplot(data=df_normals, x='Condition', y=col, ax=ax, color='black', alpha=0.7, jitter=True, size=6)
-            
-            add_stat_annotation(ax, well_df, 'Condition', col, ref_cond)
-            
-            ax.set_ylabel(title)
-            ax.set_xlabel('')
-            ax.set_title(title.split('(')[0].strip(), fontsize=14, fontweight='bold')
-            ax.tick_params(axis='x', rotation=45)
-            
-            labels = [item.get_text() for item in ax.get_xticklabels()]
-            wrapped_labels = ['\n'.join(textwrap.wrap(label, width=20)) for label in labels]
-            ax.set_xticklabels(wrapped_labels, rotation=45, ha='right', fontsize=9)
-            
-            plt.tight_layout()
-            plot_filename = f"Condition_{col}_Boxplot.png"
-            plt.savefig(os.path.join(parent_out_dir, plot_filename), dpi=300, bbox_inches='tight')
-            fig.clf()
-            plt.close('all')
+        flierprops = dict(marker='o', markerfacecolor='none', markeredgecolor='black', markersize=7, alpha=0.8)
+        sns.boxplot(data=well_df, x='Treatment', y=col, ax=ax, color=color, showfliers=True, flierprops=flierprops, width=0.5, boxprops=dict(alpha=0.6))
+        sns.stripplot(data=well_df, x='Treatment', y=col, ax=ax, color='black', alpha=0.7, jitter=True, size=6)
+        
+        add_stat_annotation(ax, well_df, 'Treatment', col, ref_cond)
+        
+        ax.set_ylabel(title)
+        ax.set_xlabel('')
+        ax.set_title(title, fontsize=14, fontweight='bold')
+        ax.tick_params(axis='x', rotation=45)
+        
+        labels = [item.get_text() for item in ax.get_xticklabels()]
+        wrapped_labels = ['\n'.join(textwrap.wrap(label, width=20)) for label in labels]
+        ax.set_xticklabels(wrapped_labels, rotation=45, ha='right', fontsize=9)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(parent_out_dir, f"Boxplot_{col}.png"), dpi=300, bbox_inches='tight')
+        plt.close(fig)
+
+    # ----------------------------------------------------
+    # 2. UMAP Dimensionality Reduction (All single cells)
+    # ----------------------------------------------------
+    try:
+        import umap
+        from sklearn.preprocessing import StandardScaler
+        
+        print("\nRunning UMAP dimensionality reduction on single-cell data...")
+        # Select all numerical features (bins, areas, properties) excluding IDs
+        exclude_cols = ['UID', 'Well', 'Field', 'Treatment', 'Local_Cell_ID']
+        feature_cols = [c for c in df_cells.columns if c not in exclude_cols]
+        
+        X = df_cells[feature_cols].fillna(0).values
+        X_scaled = StandardScaler().fit_transform(X)
+        
+        # Memory protection: Sample data if massive
+        max_cells = 50000
+        if len(df_cells) > max_cells:
+            print(f"Sampling {max_cells} cells for UMAP to save memory...")
+            sample_idx = np.random.choice(len(df_cells), max_cells, replace=False)
+            X_scaled = X_scaled[sample_idx]
+            df_umap_meta = df_cells.iloc[sample_idx].copy()
+        else:
+            df_umap_meta = df_cells.copy()
+        
+        reducer = umap.UMAP(random_state=42)
+        embedding = reducer.fit_transform(X_scaled)
+        
+        df_umap_meta['UMAP1'] = embedding[:, 0]
+        df_umap_meta['UMAP2'] = embedding[:, 1]
+        
+        fig_umap, ax_umap = plt.subplots(figsize=(10, 8))
+        sns.scatterplot(data=df_umap_meta, x='UMAP1', y='UMAP2', hue='Treatment', s=5, alpha=0.6, edgecolor=None, ax=ax_umap)
+        ax_umap.set_title("Single-Cell UMAP across all morphological & potential properties", fontweight='bold')
+        ax_umap.legend(bbox_to_anchor=(1.05, 1), loc='upper left', markerscale=3)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(parent_out_dir, "UMAP_SingleCell_Clusters.png"), dpi=300, bbox_inches='tight')
+        plt.close(fig_umap)
+        print("UMAP generation complete.")
+        
+    except ImportError:
+        print("\n[!] Could not generate UMAP: 'umap-learn' or 'scikit-learn' is not installed.")
+        print("    To enable UMAP, run: pip install umap-learn scikit-learn")
 
 
 def process_plate_directory(
@@ -849,7 +729,7 @@ def process_plate_directory(
     sigma=1.0, tophat_radius=5, test_well=None,
     use_watershed=False, nuclei_mask_method='triangle', cyto_expansion=80, mito_buffer=20, min_cyto=20, boundary_smoothing=3,
     mask_method='triangle', cnn_noise_filter_radius=25,
-    use_cnn=False, cnn_model_path=None, tmrm_max_range=0.25, plot_as_density=True,
+    use_cnn=False, cnn_model_path=None, tmrm_max_range=0.25, tmrm_threshold=0.05, plot_as_density=True,
     save_qc_nuclei=True, save_qc_mtg=True, save_qc_tmrm=True, save_qc_composite=True, save_qc_cnn=True,
     plot_only=False, master_csv_path=None
 ):
@@ -929,7 +809,7 @@ def process_plate_directory(
             f, match.group(1), match.group(2), output_paths_dict, target_channel, tmrm_channel, nuclei_channel, 
             sigma, tophat_radius, use_watershed, nuclei_mask_method,
             cyto_expansion, mito_buffer, min_cyto, boundary_smoothing, mask_method, cnn_noise_filter_radius,
-            use_cnn, cnn_masks_dict.get(f), tmrm_max_range,
+            use_cnn, cnn_masks_dict.get(f), tmrm_max_range, tmrm_threshold,
             save_qc_nuclei, save_qc_mtg, save_qc_tmrm, save_qc_composite, save_qc_cnn
         ))
 
@@ -961,7 +841,7 @@ if __name__ == "__main__":
     out_dir, paths_dict = setup_output(base_dir, "Output Images plate 3", zero_pad=True)
     treatment_dictionary = parse_tecan_d300e_xml(dtt_path)
     
-    existing_csv_path = os.path.join(out_dir, "Plate_SingleCell_Morphology_Data.csv")
+    existing_csv_path = os.path.join(out_dir, "Single_Cell_Properties.csv")
     
     process_plate_directory(
         data_dir=data_path, output_paths_dict=paths_dict, treatment_map=treatment_dictionary,
@@ -969,7 +849,7 @@ if __name__ == "__main__":
         use_cnn=True, cnn_model_path=cnn_model_file,
         sigma=1.0, tophat_radius=6, test_well=None,
         use_watershed=True, nuclei_mask_method='triangle', cyto_expansion=80, mito_buffer=20, min_cyto=20, boundary_smoothing=3,
-        mask_method='triangle', cnn_noise_filter_radius=10, tmrm_max_range=0.25, plot_as_density=True,
+        mask_method='triangle', cnn_noise_filter_radius=10, tmrm_max_range=0.25, tmrm_threshold=0.05, plot_as_density=True,
         save_qc_nuclei=True, save_qc_mtg=True, save_qc_tmrm=True, save_qc_composite=True, save_qc_cnn=True,
         plot_only=False, master_csv_path=existing_csv_path
     )
