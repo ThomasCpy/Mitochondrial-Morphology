@@ -122,25 +122,31 @@ def parse_tecan_d300e_xml(file_path):
 # ==========================================
 
 def load_as_float(image_path):
-    """loads image and forces float for safe math operations"""
+    """
+    loads image and forces float for safe math operations.
+    CRITICAL FIX: Uses the bit-depth maximum (e.g. 65535) for scaling to preserve 
+    absolute intensity differences across different wells (important for TMRM).
+    """
     if not os.path.exists(image_path):
         return None
         
     img = io.imread(image_path, as_gray=True)
     if np.max(img) == 0:
-        return img
-        
-    if img.dtype not in [np.float64, np.float32]:
-        return img.astype(np.float32) / np.max(img)
-    return img
-
-def segment_nuclei(img, min_nucleus_area=500, use_watershed=False):
+        return img.astype(np.float32)
+def segment_nuclei(img, min_nucleus_area=500, use_watershed=False, method='otsu'):
     """handles hoechst segmentation to find nuclei markers"""
     if img is None or np.max(img) == 0: 
         return None, 0
         
     img_smoothed = filters.gaussian(img, sigma=2.0)
-    thresh = filters.threshold_otsu(img_smoothed)
+    
+    if method == 'triangle':
+        thresh = filters.threshold_triangle(img_smoothed)
+    elif method == 'li':
+        thresh = filters.threshold_li(img_smoothed + 1e-8)
+    else:
+        thresh = filters.threshold_otsu(img_smoothed)
+        
     mask = img_smoothed > thresh
     
     mask_cleaned = morphology.remove_small_objects(mask, max_size=min_nucleus_area)
@@ -387,7 +393,7 @@ def _worker_process_field(args):
     """isolated worker for heavy numpy/scipy extraction operations."""
     (file_path, well_id, field_id, output_paths_dict, target_channel, 
      tmrm_channel, nuclei_channel, sigma, tophat_radius, 
-     use_watershed, cyto_expansion, mito_buffer, min_cyto, boundary_smoothing, mask_method, cnn_noise_filter_radius,
+     use_watershed, nuclei_mask_method, cyto_expansion, mito_buffer, min_cyto, boundary_smoothing, mask_method, cnn_noise_filter_radius,
      use_cnn, precomputed_mask,
      save_qc_nuclei, save_qc_mtg, save_qc_tmrm, save_qc_composite, save_qc_cnn) = args
     
@@ -401,7 +407,7 @@ def _worker_process_field(args):
     # 1. nuclei detection (d0)
     img_hoechst = load_as_float(hoechst_path)
     base_filename_hoechst = base_filename.replace(f"d{target_channel}", f"d{nuclei_channel}")
-    nuclei_labels, cell_count = segment_nuclei(img_hoechst, min_nucleus_area=500, use_watershed=use_watershed)
+    nuclei_labels, cell_count = segment_nuclei(img_hoechst, min_nucleus_area=500, use_watershed=use_watershed, method=nuclei_mask_method)
     mask_hoechst = nuclei_labels > 0 if nuclei_labels is not None else None
 
     # 2. MTG mask generation (d1)
@@ -480,13 +486,20 @@ def _worker_process_field(args):
             
             if len(morph_vals) == 0: continue
             
-            # create 20 bins capturing 0.0 to 1.0 distribution
-            hist, _ = np.histogram(morph_vals, bins=20, range=(0.0, 1.0))
+            # create 20 bins capturing 0.0 to 1.0 distribution for Morphology
+            hist_morph, _ = np.histogram(morph_vals, bins=20, range=(0.0, 1.0))
             mean_morph = np.mean(morph_vals)
             mtg_px = len(morph_vals)
             
+            # extract TMRM data and create 50 intensity bins
             t_vals = tmrm_dict.get(c_id, [])
             mean_tmrm = np.mean(t_vals) if len(t_vals) > 0 else 0.0
+            
+            # Create a 50-bin histogram for TMRM intensity from 0.0 to 1.0
+            if len(t_vals) > 0:
+                hist_tmrm, _ = np.histogram(t_vals, bins=50, range=(0.0, 1.0))
+            else:
+                hist_tmrm = np.zeros(50)
             
             global_id = f"{well_id}_f{field_id}_c{c_id}"
             
@@ -502,7 +515,10 @@ def _worker_process_field(args):
             }
             
             for b in range(20):
-                record[f"Hist_Bin_{b+1:02d}"] = hist[b]
+                record[f"Hist_Bin_{b+1:02d}"] = hist_morph[b]
+                
+            for b in range(50):
+                record[f"TMRM_Hist_Bin_{b+1:02d}"] = hist_tmrm[b]
                 
             cell_records.append(record)
 
@@ -553,10 +569,14 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
         df_cells['Condition'] = df_cells['Well_ID'].map(treatment_map).fillna("Untreated")
         
         meta_cols = ['Global_Cell_ID', 'Well_ID', 'Condition', 'Field', 'Local_Cell_ID', 'Cell_Area', 'Mito_Px', 'Mean_Morphology', 'Mean_TMRM_Intensity']
-        hist_cols = [c for c in df_cells.columns if c.startswith('Hist_Bin_')]
-        cols = meta_cols + hist_cols
-        df_cells = df_cells[cols]
+        morph_hist_cols = [f'Hist_Bin_{b:02d}' for b in range(1, 21)]
+        tmrm_hist_cols = [f'TMRM_Hist_Bin_{b:02d}' for b in range(1, 51)]
         
+        # safely handle older CSVs without TMRM bins
+        all_cols = meta_cols + morph_hist_cols + tmrm_hist_cols
+        cols = [c for c in all_cols if c in df_cells.columns]
+        
+        df_cells = df_cells[cols]
         df_cells.to_csv(csv_path, index=False)
         print(f"\nExported single-cell master dataset to: {csv_path}")
             
@@ -570,6 +590,10 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
         if f'Hist_Bin_{b:02d}' in df_cells.columns:
             agg_funcs[f'Hist_Bin_{b:02d}'] = 'sum'
             
+    for b in range(1, 51):
+        if f'TMRM_Hist_Bin_{b:02d}' in df_cells.columns:
+            agg_funcs[f'TMRM_Hist_Bin_{b:02d}'] = 'sum'
+            
     well_df = df_cells.groupby(['Well_ID', 'Condition']).agg(agg_funcs).rename(columns={'Global_Cell_ID': 'Cell_Count'}).reset_index()
     
     conditions = sorted(well_df['Condition'].unique())
@@ -580,7 +604,7 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
     # 1. Plot Continuous Morphology Distributions
     # ----------------------------------------------------
     fig_dist, ax_dist = plt.subplots(figsize=(10, 6))
-    bin_centers = np.linspace(0.025, 0.975, 20)
+    bin_centers_morph = np.linspace(0.025, 0.975, 20)
     colors = sns.color_palette("husl", len(conditions))
     
     for i, cond in enumerate(conditions):
@@ -598,8 +622,8 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
             mean_hist = np.mean(norm_hists, axis=0)
             sem_hist = stats.sem(norm_hists, axis=0) if len(norm_hists) > 1 else np.zeros_like(mean_hist)
             
-            line, = ax_dist.plot(bin_centers, mean_hist, label=cond, color=colors[i], lw=2)
-            ax_dist.fill_between(bin_centers, mean_hist - sem_hist, mean_hist + sem_hist, alpha=0.2, color=colors[i])
+            line, = ax_dist.plot(bin_centers_morph, mean_hist, label=cond, color=colors[i], lw=2)
+            ax_dist.fill_between(bin_centers_morph, mean_hist - sem_hist, mean_hist + sem_hist, alpha=0.2, color=colors[i])
 
     ax_dist.set_title("Continuous Mitochondrial Tubularness Distribution", fontsize=14, fontweight='bold')
     ax_dist.set_xlabel("Tubularness Index (0=Spotty, 1=Tubular)")
@@ -610,7 +634,40 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
     plt.close(fig_dist)
 
     # ----------------------------------------------------
-    # 2. Boxplot Analytics 
+    # 2. Plot Continuous TMRM Distributions (NEW)
+    # ----------------------------------------------------
+    if f'TMRM_Hist_Bin_01' in well_df.columns:
+        fig_tmrm, ax_tmrm = plt.subplots(figsize=(10, 6))
+        bin_centers_tmrm = np.linspace(0.01, 0.99, 50) # 50 high-res bins
+        
+        for i, cond in enumerate(conditions):
+            cond_data = well_df[well_df['Condition'] == cond]
+            if cond_data.empty: continue
+            
+            norm_hists_tmrm = []
+            for _, row in cond_data.iterrows():
+                if row['Cell_Count'] > 0:
+                    hist_vals_tmrm = np.array([row.get(f'TMRM_Hist_Bin_{b:02d}', 0) for b in range(1, 51)])
+                    norm_hists_tmrm.append(hist_vals_tmrm / row['Cell_Count'])
+                    
+            if norm_hists_tmrm:
+                norm_hists_tmrm = np.array(norm_hists_tmrm)
+                mean_hist_tmrm = np.mean(norm_hists_tmrm, axis=0)
+                sem_hist_tmrm = stats.sem(norm_hists_tmrm, axis=0) if len(norm_hists_tmrm) > 1 else np.zeros_like(mean_hist_tmrm)
+                
+                line, = ax_tmrm.plot(bin_centers_tmrm, mean_hist_tmrm, label=cond, color=colors[i], lw=2)
+                ax_tmrm.fill_between(bin_centers_tmrm, mean_hist_tmrm - sem_hist_tmrm, mean_hist_tmrm + sem_hist_tmrm, alpha=0.2, color=colors[i])
+
+        ax_tmrm.set_title("Continuous TMRM Membrane Potential Distribution", fontsize=14, fontweight='bold')
+        ax_tmrm.set_xlabel("Relative TMRM Pixel Intensity (0.0 to 1.0)")
+        ax_tmrm.set_ylabel("Average Pixel Area per Cell")
+        ax_tmrm.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        plt.tight_layout()
+        plt.savefig(os.path.join(parent_out_dir, "Condition_TMRM_Distribution.png"), dpi=300, bbox_inches='tight')
+        plt.close(fig_tmrm)
+
+    # ----------------------------------------------------
+    # 3. Boxplot Analytics 
     # ----------------------------------------------------
     metrics = [
         ('Cell_Count', 'Total Cells per Well', 'grey'),
@@ -682,11 +739,12 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
             fig.clf()
             plt.close('all')
 
+
 def process_plate_directory(
     data_dir, output_paths_dict, treatment_map, 
     target_channel="1", tmrm_channel="2", nuclei_channel="0", 
     sigma=1.5, tophat_radius=5, test_well=None,
-    use_watershed=False, cyto_expansion=80, mito_buffer=20, min_cyto=20, boundary_smoothing=3,
+    use_watershed=False, nuclei_mask_method='otsu', cyto_expansion=80, mito_buffer=20, min_cyto=20, boundary_smoothing=3,
     mask_method='triangle', cnn_noise_filter_radius=25,
     use_cnn=False, cnn_model_path=None,
     save_qc_nuclei=True, save_qc_mtg=True, save_qc_tmrm=True, save_qc_composite=True, save_qc_cnn=True,
@@ -764,7 +822,7 @@ def process_plate_directory(
         match = pattern.search(f)
         tasks.append((
             f, match.group(1), match.group(2), output_paths_dict, target_channel, tmrm_channel, nuclei_channel, 
-            sigma, tophat_radius, use_watershed, 
+            sigma, tophat_radius, use_watershed, nuclei_mask_method,
             cyto_expansion, mito_buffer, min_cyto, boundary_smoothing, mask_method, cnn_noise_filter_radius,
             use_cnn, cnn_masks_dict.get(f), 
             save_qc_nuclei, save_qc_mtg, save_qc_tmrm, save_qc_composite, save_qc_cnn
@@ -805,7 +863,7 @@ if __name__ == "__main__":
         target_channel="1", tmrm_channel="2", nuclei_channel="0", 
         use_cnn=True, cnn_model_path=cnn_model_file,
         sigma=1.5, tophat_radius=6, test_well=None,
-        use_watershed=True, cyto_expansion=80, mito_buffer=20, min_cyto=20, boundary_smoothing=3,
+        use_watershed=True, nuclei_mask_method='otsu', cyto_expansion=80, mito_buffer=20, min_cyto=20, boundary_smoothing=3,
         mask_method='triangle', cnn_noise_filter_radius=10,
         save_qc_nuclei=True, save_qc_mtg=True, save_qc_tmrm=True, save_qc_composite=True, save_qc_cnn=True,
         plot_only=False, master_csv_path=existing_csv_path
