@@ -133,6 +133,17 @@ def load_as_float(image_path):
     img = io.imread(image_path, as_gray=True)
     if np.max(img) == 0:
         return img.astype(np.float32)
+        
+    # Safely scale based on hardware bit-depth
+    if img.dtype == np.uint8:
+        return img.astype(np.float32) / 255.0
+    elif img.dtype == np.uint16:
+        return img.astype(np.float32) / 65535.0
+    elif img.dtype not in [np.float64, np.float32]:
+        return img.astype(np.float32) / 65535.0
+        
+    return img
+
 def segment_nuclei(img, min_nucleus_area=500, use_watershed=False, method='otsu'):
     """handles hoechst segmentation to find nuclei markers"""
     if img is None or np.max(img) == 0: 
@@ -751,12 +762,14 @@ def process_plate_directory(
     plot_only=False, master_csv_path=None
 ):
     if plot_only:
-        print("\n--- phase: plotting only (skipping image extraction) ---")
         if master_csv_path and os.path.exists(master_csv_path):
+            print("\n--- phase: plotting only (skipping image extraction) ---")
             aggregate_and_plot_data(None, None, None, csv_path_override=master_csv_path)
+            return
         else:
-            print(f"error: plot_only is true but valid master_csv_path was not found at {master_csv_path}")
-        return
+            print(f"\n[!] Notice: plot_only is True, but no existing dataset was found at: {master_csv_path}")
+            print("    Automatically falling back to full image extraction pipeline...\n")
+            # Continues to extraction instead of returning
 
     search_pattern = os.path.join(data_dir, "*.[tT][iI][fF]*")
     all_files = glob.glob(search_pattern)
