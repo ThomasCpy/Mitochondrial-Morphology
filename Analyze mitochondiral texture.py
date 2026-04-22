@@ -45,7 +45,6 @@ def setup_output(base_path, folder_name="Output masks", zero_pad=True):
     print(f"Generated 96-well plate structure in: {output_dir}")
     return output_dir, well_paths
 
-
 # ==========================================
 # TECAN PARSER
 # ==========================================
@@ -118,7 +117,6 @@ def parse_tecan_d300e_xml(file_path):
 
     return treatment_output
 
-
 # ==========================================
 # IMAGE PROCESSING FUNCTIONS
 # ==========================================
@@ -137,7 +135,6 @@ def load_as_float(image_path):
         
     img_max = np.max(img)
     
-    # Guess the true camera hardware limit based on the brightest pixel in this specific image
     if img.dtype == np.uint8 or img_max <= 255:
         scale_factor = 255.0
     elif img_max <= 4095:       # 12-bit camera
@@ -214,12 +211,10 @@ def define_cell_territories(img_hoechst, nuclei_labels, mask_mtg, out_folder, ba
         axes[0].imshow(img_hoechst, cmap='gray'); axes[0].set_title('original hoechst'); axes[0].axis('off')
         
         axes[1].imshow(img_hoechst, cmap='gray')
-        # Overlay nuclei in transparent blue
         blue_rgba = np.zeros((*img_hoechst.shape, 4), dtype=np.uint8)
         blue_rgba[nuclei_labels > 0] = [0, 0, 255, int(0.5 * 255)]
         axes[1].imshow(blue_rgba)
         
-        # Overlay cell boundaries in solid red
         boundaries = segmentation.find_boundaries(cell_labels, mode='inner')
         bound_rgba = np.zeros((*img_hoechst.shape, 4), dtype=np.uint8)
         bound_rgba[boundaries] = [255, 0, 0, 255]
@@ -278,20 +273,17 @@ def generate_cnn_mask_sequential(img, sess, input_name, patch_h, patch_w, suppre
     for i in range(0, padded_h, patch_h):
         for j in range(0, padded_w, patch_w):
             tile = img_padded[i:i+patch_h, j:j+patch_w]
-            # ONNX expects float32 arrays
             tile_batch = np.expand_dims(np.expand_dims(tile, axis=0), axis=-1).astype(np.float32)
             
             if not suppress_output:
                 print(f"      [Tile {tile_idx:02d}/{total_tiles:02d}] inferring on GPU...", end="\r", flush=True)
             
-            # ONNX execution
             pred = sess.run(None, {input_name: tile_batch})[0]
-            
             pred_padded[i:i+patch_h, j:j+patch_w] = pred[0, :, :, 0]
             tile_idx += 1
             
     if not suppress_output:
-        print(" " * 65, end="\r") # clear the line once done
+        print(" " * 65, end="\r")
 
     pred_mask = pred_padded > 0.5 
     mask = pred_mask[:h, :w]
@@ -309,7 +301,6 @@ def save_mask_visualisation(img, mask, out_folder, base_name, overlay_color='pur
     axes[0].imshow(img, cmap='gray'); axes[0].set_title('original image'); axes[0].axis('off')
     axes[1].imshow(img, cmap='gray')
     
-    # memory fix: force uint8 (8-bit) array instead of float64 (64-bit) to prevent RAM explosion
     rgba = np.zeros((*img.shape, 4), dtype=np.uint8)
     rgb_color = mcolors.to_rgb(overlay_color)
     rgba[mask] = [int(c * 255) for c in rgb_color] + [int(alpha * 255)]
@@ -339,13 +330,11 @@ def save_master_overlay_qc(img_base, mask_hoechst, mask_mtg, cell_labels, img_tm
     fig, ax = plt.subplots(figsize=(10, 10))
     ax.imshow(img_base, cmap='gray')
     
-    # memory fix: force uint8 arrays. float64 arrays of 2843x2843x4 take exactly 247 MiB of RAM each!
     if img_tmrm is not None:
-        # Scale TMRM intensity visually for the red transparent overlay
         tmrm_norm = img_tmrm / (np.max(img_tmrm) + 1e-8)
         red_rgba = np.zeros((*img_base.shape, 4), dtype=np.uint8)
-        red_rgba[..., 0] = 255 # Pure red
-        red_rgba[..., 3] = (tmrm_norm * 0.5 * 255).astype(np.uint8) # Opacity scales with TMRM intensity
+        red_rgba[..., 0] = 255 
+        red_rgba[..., 3] = (tmrm_norm * 0.5 * 255).astype(np.uint8) 
         ax.imshow(red_rgba)
         
     if mask_hoechst is not None:
@@ -359,7 +348,7 @@ def save_master_overlay_qc(img_base, mask_hoechst, mask_mtg, cell_labels, img_tm
     if cell_labels is not None:
         boundaries = segmentation.find_boundaries(cell_labels, mode='inner')
         bound_rgba = np.zeros((*img_base.shape, 4), dtype=np.uint8)
-        bound_rgba[boundaries] = [255, 255, 255, 255] # Changed to solid White to contrast with red TMRM
+        bound_rgba[boundaries] = [255, 255, 255, 255] 
         ax.imshow(bound_rgba)
         
     ax.axis('off')
@@ -375,15 +364,9 @@ def calculate_morphology(img_base, mask, sigma=0.8):
     lambda1, lambda2 = feature.hessian_matrix_eigvals(H_elems)
     
     epsilon = 1e-8
-    # lambda2 is the cross-sectional curvature (large absolute value for tubes)
-    # lambda1 is the longitudinal curvature (small absolute value for tubes)
-    # the ratio approaches 0 for tubular structures and 1 for spotty/circular structures
     ratio = np.abs(lambda1) / (np.abs(lambda2) + epsilon)
-    
-    # invert the scale so 1.0 = highly tubular and 0.0 = spotty
     morphology_index = 1.0 - ratio
     
-    # dark background means eigenvalues should be negative for bright ridges
     morphology_index[lambda2 > 0] = 0
     morphology_index = np.clip(morphology_index, 0, 1)
 
@@ -404,7 +387,6 @@ def save_morphology_qc(img_clahe, mask, smoothed_index, out_folder, base_name):
     """dumps the continuous morphology map for manual checking"""
     cmap_cont = LinearSegmentedColormap.from_list('spot_to_tube', ['red', 'blue'])
     
-    # memory fix: cmap returns float64, immediately scale and cast to uint8
     colored_index = (cmap_cont(smoothed_index) * 255).astype(np.uint8)
     colored_index[~mask] = [0, 0, 0, 255]
 
@@ -419,7 +401,6 @@ def save_morphology_qc(img_clahe, mask, smoothed_index, out_folder, base_name):
     plt.savefig(os.path.join(out_folder, f"{base_name}_comp_continuous.png"), dpi=300)
     fig_cont.clf()
     plt.close('all')
-
 
 # ==========================================
 # PARALLEL WORKER AND AGGREGATION
@@ -440,13 +421,11 @@ def _worker_process_field(args):
     hoechst_path = file_path.replace(f"d{target_channel}", f"d{nuclei_channel}")
     tmrm_path = file_path.replace(f"d{target_channel}", f"d{tmrm_channel}")
 
-    # 1. nuclei detection (d0)
     img_hoechst = load_as_float(hoechst_path)
     base_filename_hoechst = base_filename.replace(f"d{target_channel}", f"d{nuclei_channel}")
     nuclei_labels, cell_count = segment_nuclei(img_hoechst, min_nucleus_area=500, use_watershed=use_watershed, method=nuclei_mask_method)
     mask_hoechst = nuclei_labels > 0 if nuclei_labels is not None else None
 
-    # 2. MTG mask generation (d1)
     img_mtg = load_as_float(file_path)
     if img_mtg is None or np.max(img_mtg) == 0:
         return None
@@ -468,7 +447,6 @@ def _worker_process_field(args):
     else:
         mask_mtg = get_mask(img_tophat, sigma=2.0, method=mask_method)
 
-    # 3. MTG morphology calculation
     smoothed_index = calculate_morphology(img_clahe, mask_mtg, sigma=sigma)
     
     if save_qc_mtg:
@@ -476,7 +454,6 @@ def _worker_process_field(args):
         os.makedirs(qc_mtg_dir, exist_ok=True)
         save_morphology_qc(img_clahe, mask_mtg, smoothed_index, qc_mtg_dir, base_filename)
 
-    # 4. TMRM alignment (d2)
     img_tmrm = load_as_float(tmrm_path)
     
     if save_qc_tmrm and img_tmrm is not None:
@@ -484,7 +461,6 @@ def _worker_process_field(args):
         os.makedirs(qc_tmrm_dir, exist_ok=True)
         save_tmrm_mtg_overlay_qc(img_tmrm, mask_mtg, qc_tmrm_dir, base_filename)
 
-    # 5. Smart cell territories
     qc_nuclei_dir = os.path.join(well_out_dir, "Hoechst Cell Zones") if save_qc_nuclei else None
     if save_qc_nuclei: os.makedirs(qc_nuclei_dir, exist_ok=True)
         
@@ -495,23 +471,19 @@ def _worker_process_field(args):
         save_qc=save_qc_nuclei
     )
 
-    # 6. Composites
     if save_qc_composite and mask_hoechst is not None and mask_mtg is not None:
         qc_comp_dir = os.path.join(well_out_dir, "Master Composite")
         os.makedirs(qc_comp_dir, exist_ok=True)
         save_master_overlay_qc(img_clahe, mask_hoechst, mask_mtg, cell_labels, img_tmrm, qc_comp_dir, base_filename)
 
-    # 7. Single Cell Extraction (Histograms & Means)
     cell_records = []
     if cell_count > 0 and cell_labels is not None:
         props_cells = measure.regionprops(cell_labels)
         area_dict = {p.label: p.area for p in props_cells}
         
-        # Get Nuclear Areas (nuclei_labels share exact IDs with cell_labels via watershed map)
         props_nuc = measure.regionprops(nuclei_labels)
         nuc_area_dict = {p.label: p.area for p in props_nuc}
         
-        # Mask out non-mito pixels so regionprops only looks at structural networks
         mtg_labels = cell_labels * mask_mtg
         props_morph = measure.regionprops(mtg_labels, intensity_image=smoothed_index)
         
@@ -525,7 +497,6 @@ def _worker_process_field(args):
             props_mtg_raw = measure.regionprops(mtg_labels, intensity_image=img_mtg)
             mtg_raw_dict = {p.label: p.intensity_image[p.image] for p in props_mtg_raw}
             
-        # Bin Configurations
         mtg_bin_size = 1.0 / 20.0
         tmrm_bin_size = tmrm_max_range / 20.0
         morph_bin_size = 1.0 / 20.0
@@ -540,10 +511,8 @@ def _worker_process_field(args):
             mean_morph = np.mean(morph_vals)
             mean_spottiness = 1.0 - mean_morph
             
-            # Tubularness Bins
             hist_morph, _ = np.histogram(morph_vals, bins=20, range=(0.0, 1.0))
             
-            # TMRM processing and Overlap
             t_vals = tmrm_dict.get(c_id, np.array([]))
             if len(t_vals) > 0:
                 hist_tmrm, _ = np.histogram(t_vals, bins=20, range=(0.0, tmrm_max_range))
@@ -552,7 +521,6 @@ def _worker_process_field(args):
                 hist_tmrm = np.zeros(20)
                 overlap_pct = 0.0
                 
-            # MTG Raw processing
             m_raw_vals = mtg_raw_dict.get(c_id, np.array([]))
             if len(m_raw_vals) > 0:
                 hist_mtg, _ = np.histogram(m_raw_vals, bins=20, range=(0.0, 1.0))
@@ -565,7 +533,7 @@ def _worker_process_field(args):
                 "UID": global_id,
                 "Well": well_id, 
                 "Field": field_id, 
-                "Treatment": "Unknown", # Added in aggregate function
+                "Treatment": "Unknown", 
                 "Local_Cell_ID": c_id,
                 "Area": area_dict.get(c_id, 0),
                 "Nuclear_Area": nuc_area_dict.get(c_id, 0),
@@ -576,7 +544,6 @@ def _worker_process_field(args):
             }
             
             for b in range(20):
-                # Bin names dynamically reflecting the requested sizes
                 record[f"Tubularness_Bin_Size_{morph_bin_size:.2f}_Idx_{b+1:02d}"] = hist_morph[b]
                 record[f"MTG_RawInt_Bin_Size_{mtg_bin_size:.2f}_Idx_{b+1:02d}"] = hist_mtg[b]
                 record[f"TMRM_RawInt_Bin_Size_{tmrm_bin_size:.3f}_Idx_{b+1:02d}"] = hist_tmrm[b]
@@ -615,7 +582,7 @@ def add_stat_annotation(ax, data, x_col, y_col, ref_cond):
             current_y += step * 1.5
 
 def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv_path_override=None, tmrm_max_range=0.25, plot_as_density=True):
-    """saves single-cell data, runs UMAP and Boxplots as requested"""
+    """saves single-cell data, runs tight UMAP and generates feature-colored plots"""
     if csv_path_override and os.path.exists(csv_path_override):
         df_cells = pd.read_csv(csv_path_override)
         parent_out_dir = os.path.dirname(csv_path_override)
@@ -625,18 +592,15 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
         parent_out_dir = os.path.dirname(output_paths_dict[all_cell_data[0]["Well"]])
         
         df_cells = pd.DataFrame(all_cell_data)
-        # Map treatments
         df_cells['Treatment'] = df_cells['Well'].map(treatment_map).fillna("Untreated")
         
         csv_path = os.path.join(parent_out_dir, "Single_Cell_Properties.csv")
-        # Ensure ID columns are at the front
         cols = ['UID', 'Well', 'Field', 'Treatment'] + [c for c in df_cells.columns if c not in ['UID', 'Well', 'Field', 'Treatment']]
         df_cells = df_cells[cols]
         
         df_cells.to_csv(csv_path, index=False)
         print(f"\nExported single-cell master dataset to: {csv_path}")
 
-    # Plotting starts from zero
     sns.set_style("whitegrid")
     conditions = sorted(df_cells['Treatment'].unique())
     ref_cond = "Vehicle" if "Vehicle" in conditions else conditions[0]
@@ -644,7 +608,6 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
     # ----------------------------------------------------
     # 1. Boxplot Analytics (Aggregated per Well)
     # ----------------------------------------------------
-    # Calculate requested specific medians and means per well
     well_df = df_cells.groupby(['Well', 'Treatment']).agg(
         Median_Tubularness=('Mean_Tubularness', 'median'),
         Median_Spottiness=('Mean_Spottiness', 'median'),
@@ -680,18 +643,15 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
         plt.close(fig)
 
     # ----------------------------------------------------
-    # 2. UMAP Dimensionality Reduction (All single cells)
+    # 2. UMAP Dimensionality Reduction (Tightly Clustered)
     # ----------------------------------------------------
-    
     print("\nRunning UMAP dimensionality reduction on single-cell data...")
-    # Select all numerical features (bins, areas, properties) excluding IDs
     exclude_cols = ['UID', 'Well', 'Field', 'Treatment', 'Local_Cell_ID']
     feature_cols = [c for c in df_cells.columns if c not in exclude_cols]
     
     X = df_cells[feature_cols].fillna(0).values
     X_scaled = StandardScaler().fit_transform(X)
     
-    # Memory protection: Sample data if massive
     max_cells = 50000
     if len(df_cells) > max_cells:
         print(f"Sampling {max_cells} cells for UMAP to save memory...")
@@ -701,20 +661,47 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
     else:
         df_umap_meta = df_cells.copy()
     
-    reducer = umap.UMAP(random_state=42)
+    # MODIFIED: Reduced min_dist and increased n_neighbors for tighter, solid clusters
+    reducer = umap.UMAP(n_neighbors=50, min_dist=0.01, random_state=42)
     embedding = reducer.fit_transform(X_scaled)
     
     df_umap_meta['UMAP1'] = embedding[:, 0]
     df_umap_meta['UMAP2'] = embedding[:, 1]
     
+    # --- A. Main UMAP by Treatment ---
     fig_umap, ax_umap = plt.subplots(figsize=(10, 8))
     sns.scatterplot(data=df_umap_meta, x='UMAP1', y='UMAP2', hue='Treatment', s=5, alpha=0.6, edgecolor=None, ax=ax_umap)
-    ax_umap.set_title("Single-Cell UMAP across all morphological & potential properties", fontweight='bold')
+    ax_umap.set_title("Single-Cell UMAP (Treatment Clusters)", fontweight='bold')
     ax_umap.legend(bbox_to_anchor=(1.05, 1), loc='upper left', markerscale=3)
     
     plt.tight_layout()
-    plt.savefig(os.path.join(parent_out_dir, "UMAP_SingleCell_Clusters.png"), dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(parent_out_dir, "UMAP_SingleCell_Clusters_Treatment.png"), dpi=300, bbox_inches='tight')
     plt.close(fig_umap)
+    
+    # --- B. UMAPs colored by every feature (Viridis) ---
+    print("Generating feature-colored UMAP overlays (viridis)...")
+    umap_dir = os.path.join(parent_out_dir, "UMAP_Features")
+    os.makedirs(umap_dir, exist_ok=True)
+    
+    for feature in tqdm(feature_cols, desc="Saving Feature UMAPs"):
+        fig, ax = plt.subplots(figsize=(10, 8))
+        
+        # Plot continuous values using scatter and viridis
+        sc = ax.scatter(df_umap_meta['UMAP1'], df_umap_meta['UMAP2'],
+                        c=df_umap_meta[feature], cmap='viridis', s=5, alpha=0.6, edgecolors='none')
+        
+        plt.colorbar(sc, ax=ax, label=feature)
+        ax.set_title(f"UMAP Structure by: {feature}", fontweight='bold')
+        ax.set_xlabel('UMAP1')
+        ax.set_ylabel('UMAP2')
+        
+        # Clean feature name for saving to disk
+        safe_fname = str(feature).replace(" ", "_").replace("/", "_")
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(umap_dir, f"UMAP_{safe_fname}.png"), dpi=300, bbox_inches='tight')
+        plt.close(fig)
+
     print("UMAP generation complete.")
     
 def process_plate_directory(
@@ -735,7 +722,6 @@ def process_plate_directory(
         else:
             print(f"\n[!] Notice: plot_only is True, but no existing dataset was found at: {master_csv_path}")
             print("    Automatically falling back to full image extraction pipeline...\n")
-            # Continues to extraction instead of returning
 
     search_pattern = os.path.join(data_dir, "*.[tT][iI][fF]*")
     all_files = glob.glob(search_pattern)
@@ -756,7 +742,6 @@ def process_plate_directory(
             print("Please run: pip install onnxruntime-directml\n")
             return
 
-        # Request DirectML (Windows GPU) first, fallback to CPU if it fails
         providers = ['DmlExecutionProvider', 'CPUExecutionProvider']
         
         print("Loading ONNX Model into VRAM via DirectX 12...")
@@ -764,14 +749,13 @@ def process_plate_directory(
             sess = ort.InferenceSession(cnn_model_path, providers=providers)
             active_provider = sess.get_providers()[0]
             if active_provider == 'DmlExecutionProvider':
-                print("[SUCCESS] RTX 3060Ti active and ready.")
+                print("[SUCCESS] RTX active and ready.")
             else:
                 print(f"[WARNING] DirectML failed to load. Falling back to CPU ({active_provider}).")
                 
             input_name = sess.get_inputs()[0].name
             input_shape = sess.get_inputs()[0].shape
             
-            # Handle dynamic shapes gracefully
             patch_h = input_shape[1] if isinstance(input_shape[1], int) else 656
             patch_w = input_shape[2] if isinstance(input_shape[2], int) else 656
                 
@@ -782,7 +766,6 @@ def process_plate_directory(
                 if img_mtg is None or np.max(img_mtg) == 0: continue
                 img_clahe, _ = preprocess_image(img_mtg, tophat_radius)
                 
-                # Execute inference using ONNX
                 cnn_masks_dict[f] = generate_cnn_mask_sequential(img_clahe, sess, input_name, patch_h, patch_w, suppress_output=False)
 
             print("\n--- Phase 1 Complete. Releasing VRAM... ---")
@@ -831,15 +814,9 @@ if __name__ == "__main__":
     dtt_path = "C:/Users/lab/OneDrive - Vandria/Bureau/Morphology/Drug treatment plate 3.tdd"
     cnn_model_file = r"C:/Users/lab/OneDrive - Vandria/Bureau/Morphology/MitoSegNet_model.onnx"
     
-    
+    # Cleaned up duplicate assignments from the original script
     out_dir, paths_dict = setup_output(base_dir, "Output Images plate", zero_pad=True)
     treatment_dictionary = parse_tecan_d300e_xml(dtt_path)
-    
-    existing_csv_path = os.path.join(out_dir, "Plate_SingleCell_Morphology_Data.csv")
-    
-    out_dir, paths_dict = setup_output(base_dir, "Output Images plate", zero_pad=True)
-    treatment_dictionary = parse_tecan_d300e_xml(dtt_path)
-    
     existing_csv_path = os.path.join(out_dir, "Single_Cell_Properties.csv")
     
     process_plate_directory(
@@ -850,5 +827,6 @@ if __name__ == "__main__":
         use_watershed=True, nuclei_mask_method='triangle', cyto_expansion=80, mito_buffer=20, min_cyto=20, boundary_smoothing=3,
         mask_method='triangle', cnn_noise_filter_radius=10, tmrm_max_range=0.25, tmrm_threshold=0.05, plot_as_density=True,
         save_qc_nuclei=True, save_qc_mtg=True, save_qc_tmrm=True, save_qc_composite=True, save_qc_cnn=True,
-        plot_only=False, master_csv_path=existing_csv_path
+        plot_only=True, 
+        master_csv_path=existing_csv_path
     )
