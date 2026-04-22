@@ -18,6 +18,8 @@ import xml.etree.ElementTree as ET
 from collections import defaultdict
 import concurrent.futures
 import gc
+import umap.umap_ as umap
+from sklearn.preprocessing import StandardScaler
 
 
 # ==========================================
@@ -680,49 +682,41 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
     # ----------------------------------------------------
     # 2. UMAP Dimensionality Reduction (All single cells)
     # ----------------------------------------------------
-    try:
-        import umap
-        from sklearn.preprocessing import StandardScaler
-        
-        print("\nRunning UMAP dimensionality reduction on single-cell data...")
-        # Select all numerical features (bins, areas, properties) excluding IDs
-        exclude_cols = ['UID', 'Well', 'Field', 'Treatment', 'Local_Cell_ID']
-        feature_cols = [c for c in df_cells.columns if c not in exclude_cols]
-        
-        X = df_cells[feature_cols].fillna(0).values
-        X_scaled = StandardScaler().fit_transform(X)
-        
-        # Memory protection: Sample data if massive
-        max_cells = 50000
-        if len(df_cells) > max_cells:
-            print(f"Sampling {max_cells} cells for UMAP to save memory...")
-            sample_idx = np.random.choice(len(df_cells), max_cells, replace=False)
-            X_scaled = X_scaled[sample_idx]
-            df_umap_meta = df_cells.iloc[sample_idx].copy()
-        else:
-            df_umap_meta = df_cells.copy()
-        
-        reducer = umap.UMAP(random_state=42)
-        embedding = reducer.fit_transform(X_scaled)
-        
-        df_umap_meta['UMAP1'] = embedding[:, 0]
-        df_umap_meta['UMAP2'] = embedding[:, 1]
-        
-        fig_umap, ax_umap = plt.subplots(figsize=(10, 8))
-        sns.scatterplot(data=df_umap_meta, x='UMAP1', y='UMAP2', hue='Treatment', s=5, alpha=0.6, edgecolor=None, ax=ax_umap)
-        ax_umap.set_title("Single-Cell UMAP across all morphological & potential properties", fontweight='bold')
-        ax_umap.legend(bbox_to_anchor=(1.05, 1), loc='upper left', markerscale=3)
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(parent_out_dir, "UMAP_SingleCell_Clusters.png"), dpi=300, bbox_inches='tight')
-        plt.close(fig_umap)
-        print("UMAP generation complete.")
-        
-    except ImportError:
-        print("\n[!] Could not generate UMAP: 'umap-learn' or 'scikit-learn' is not installed.")
-        print("    To enable UMAP, run: pip install umap-learn scikit-learn")
-
-
+    
+    print("\nRunning UMAP dimensionality reduction on single-cell data...")
+    # Select all numerical features (bins, areas, properties) excluding IDs
+    exclude_cols = ['UID', 'Well', 'Field', 'Treatment', 'Local_Cell_ID']
+    feature_cols = [c for c in df_cells.columns if c not in exclude_cols]
+    
+    X = df_cells[feature_cols].fillna(0).values
+    X_scaled = StandardScaler().fit_transform(X)
+    
+    # Memory protection: Sample data if massive
+    max_cells = 50000
+    if len(df_cells) > max_cells:
+        print(f"Sampling {max_cells} cells for UMAP to save memory...")
+        sample_idx = np.random.choice(len(df_cells), max_cells, replace=False)
+        X_scaled = X_scaled[sample_idx]
+        df_umap_meta = df_cells.iloc[sample_idx].copy()
+    else:
+        df_umap_meta = df_cells.copy()
+    
+    reducer = umap.UMAP(random_state=42)
+    embedding = reducer.fit_transform(X_scaled)
+    
+    df_umap_meta['UMAP1'] = embedding[:, 0]
+    df_umap_meta['UMAP2'] = embedding[:, 1]
+    
+    fig_umap, ax_umap = plt.subplots(figsize=(10, 8))
+    sns.scatterplot(data=df_umap_meta, x='UMAP1', y='UMAP2', hue='Treatment', s=5, alpha=0.6, edgecolor=None, ax=ax_umap)
+    ax_umap.set_title("Single-Cell UMAP across all morphological & potential properties", fontweight='bold')
+    ax_umap.legend(bbox_to_anchor=(1.05, 1), loc='upper left', markerscale=3)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(parent_out_dir, "UMAP_SingleCell_Clusters.png"), dpi=300, bbox_inches='tight')
+    plt.close(fig_umap)
+    print("UMAP generation complete.")
+    
 def process_plate_directory(
     data_dir, output_paths_dict, treatment_map, 
     target_channel="1", tmrm_channel="2", nuclei_channel="0", 
@@ -832,13 +826,18 @@ def process_plate_directory(
 # ==========================================
 
 if __name__ == "__main__":
-    base_dir = r"C:/Users/Thomas/Desktop/Temp local/General NQO2 Search/Morphology"
-    data_path= r"C:/Users/Thomas/Vandria/Superlab - 4 NQO2 Biology/Mitophagy/Microscopy/04 - TMRM & MitoTracker/TCH_003_TMRM_MTG_HepG2/Plate 3/AcquireOnly.V3_04-09-26_05;16;16"
-    dtt_path = "C:/Users/Thomas/Vandria/Superlab - 4 NQO2 Biology/Mitophagy/Microscopy/04 - TMRM & MitoTracker/TCH_003_TMRM_MTG_HepG2/Plate 3/Drug treatment plate 3.tdd"
+    base_dir = r"C:/Users/lab/OneDrive - Vandria/Bureau/Morphology"
+    data_path= r"C:/Users/lab/OneDrive - Vandria/Bureau/Morphology/AcquireOnly.V3_04-09-26_05;16;16"
+    dtt_path = "C:/Users/lab/OneDrive - Vandria/Bureau/Morphology/Drug treatment plate 3.tdd"
+    cnn_model_file = r"C:/Users/lab/OneDrive - Vandria/Bureau/Morphology/MitoSegNet_model.onnx"
     
-    cnn_model_file = r"C:/Users/Thomas/Desktop/Temp local/General NQO2 Search/Morphology/MitoSegNet_model.onnx"
     
-    out_dir, paths_dict = setup_output(base_dir, "Output Images plate 3", zero_pad=True)
+    out_dir, paths_dict = setup_output(base_dir, "Output Images plate", zero_pad=True)
+    treatment_dictionary = parse_tecan_d300e_xml(dtt_path)
+    
+    existing_csv_path = os.path.join(out_dir, "Plate_SingleCell_Morphology_Data.csv")
+    
+    out_dir, paths_dict = setup_output(base_dir, "Output Images plate", zero_pad=True)
     treatment_dictionary = parse_tecan_d300e_xml(dtt_path)
     
     existing_csv_path = os.path.join(out_dir, "Single_Cell_Properties.csv")
