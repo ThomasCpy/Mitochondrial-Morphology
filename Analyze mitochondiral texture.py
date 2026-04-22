@@ -425,7 +425,7 @@ def _worker_process_field(args):
     (file_path, well_id, field_id, output_paths_dict, target_channel, 
      tmrm_channel, nuclei_channel, sigma, tophat_radius, 
      use_watershed, nuclei_mask_method, cyto_expansion, mito_buffer, min_cyto, boundary_smoothing, mask_method, cnn_noise_filter_radius,
-     use_cnn, precomputed_mask,
+     use_cnn, precomputed_mask, tmrm_max_range,
      save_qc_nuclei, save_qc_mtg, save_qc_tmrm, save_qc_composite, save_qc_cnn) = args
     
     well_out_dir = output_paths_dict.get(well_id)
@@ -526,9 +526,9 @@ def _worker_process_field(args):
             t_vals = tmrm_dict.get(c_id, [])
             mean_tmrm = np.mean(t_vals) if len(t_vals) > 0 else 0.0
             
-            # Create a 50-bin histogram for TMRM intensity from 0.0 to 1.0
+            # Create a 50-bin histogram for TMRM intensity from 0.0 to tmrm_max_range
             if len(t_vals) > 0:
-                hist_tmrm, _ = np.histogram(t_vals, bins=50, range=(0.0, 1.0))
+                hist_tmrm, _ = np.histogram(t_vals, bins=50, range=(0.0, tmrm_max_range))
             else:
                 hist_tmrm = np.zeros(50)
             
@@ -584,7 +584,7 @@ def add_stat_annotation(ax, data, x_col, y_col, ref_cond):
             ax.text((ref_idx + i) / 2, current_y + step/3, stars, ha='center', va='bottom', color='k')
             current_y += step * 1.5
 
-def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv_path_override=None):
+def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv_path_override=None, tmrm_max_range=0.25):
     """saves single-cell morphological and potential data, plots continuous distribution curves, and boxplots"""
     if csv_path_override and os.path.exists(csv_path_override):
         df_cells = pd.read_csv(csv_path_override)
@@ -669,7 +669,10 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
     # ----------------------------------------------------
     if f'TMRM_Hist_Bin_01' in well_df.columns:
         fig_tmrm, ax_tmrm = plt.subplots(figsize=(10, 6))
-        bin_centers_tmrm = np.linspace(0.01, 0.99, 50) # 50 high-res bins
+        
+        # Calculate centers based on the range used during extraction
+        bin_centers_tmrm = np.linspace(tmrm_max_range/100, tmrm_max_range - tmrm_max_range/100, 50) 
+        max_meaningful_idx = 0
         
         for i, cond in enumerate(conditions):
             cond_data = well_df[well_df['Condition'] == cond]
@@ -688,10 +691,22 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
                 
                 line, = ax_tmrm.plot(bin_centers_tmrm, mean_hist_tmrm, label=cond, color=colors[i], lw=2)
                 ax_tmrm.fill_between(bin_centers_tmrm, mean_hist_tmrm - sem_hist_tmrm, mean_hist_tmrm + sem_hist_tmrm, alpha=0.2, color=colors[i])
+                
+                # Find the highest bin index where signal is > 1% of this condition's peak
+                peak = np.max(mean_hist_tmrm)
+                if peak > 0:
+                    active_bins = np.where(mean_hist_tmrm > (peak * 0.01))[0]
+                    if len(active_bins) > 0:
+                        max_meaningful_idx = max(max_meaningful_idx, active_bins[-1])
 
         ax_tmrm.set_title("Continuous TMRM Membrane Potential Distribution", fontsize=14, fontweight='bold')
-        ax_tmrm.set_xlabel("Relative TMRM Pixel Intensity (0.0 to 1.0)")
+        ax_tmrm.set_xlabel(f"Relative TMRM Pixel Intensity (0.0 to {tmrm_max_range})")
         ax_tmrm.set_ylabel("Average Pixel Area per Cell")
+        
+        # Crop the X-axis dynamically to remove dead space, padding by 3 bins
+        plot_max_idx = min(49, max_meaningful_idx + 3)
+        ax_tmrm.set_xlim(0, bin_centers_tmrm[plot_max_idx])
+        
         ax_tmrm.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
         plt.tight_layout()
         plt.savefig(os.path.join(parent_out_dir, "Condition_TMRM_Distribution.png"), dpi=300, bbox_inches='tight')
@@ -774,17 +789,17 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
 def process_plate_directory(
     data_dir, output_paths_dict, treatment_map, 
     target_channel="1", tmrm_channel="2", nuclei_channel="0", 
-    sigma=1.5, tophat_radius=5, test_well=None,
-    use_watershed=False, nuclei_mask_method='otsu', cyto_expansion=80, mito_buffer=20, min_cyto=20, boundary_smoothing=3,
+    sigma=1.0, tophat_radius=5, test_well=None,
+    use_watershed=False, nuclei_mask_method='triangle', cyto_expansion=80, mito_buffer=20, min_cyto=20, boundary_smoothing=3,
     mask_method='triangle', cnn_noise_filter_radius=25,
-    use_cnn=False, cnn_model_path=None,
+    use_cnn=False, cnn_model_path=None, tmrm_max_range=0.25,
     save_qc_nuclei=True, save_qc_mtg=True, save_qc_tmrm=True, save_qc_composite=True, save_qc_cnn=True,
     plot_only=False, master_csv_path=None
 ):
     if plot_only:
         if master_csv_path and os.path.exists(master_csv_path):
             print("\n--- phase: plotting only (skipping image extraction) ---")
-            aggregate_and_plot_data(None, None, None, csv_path_override=master_csv_path)
+            aggregate_and_plot_data(None, None, None, csv_path_override=master_csv_path, tmrm_max_range=tmrm_max_range)
             return
         else:
             print(f"\n[!] Notice: plot_only is True, but no existing dataset was found at: {master_csv_path}")
@@ -857,7 +872,7 @@ def process_plate_directory(
             f, match.group(1), match.group(2), output_paths_dict, target_channel, tmrm_channel, nuclei_channel, 
             sigma, tophat_radius, use_watershed, nuclei_mask_method,
             cyto_expansion, mito_buffer, min_cyto, boundary_smoothing, mask_method, cnn_noise_filter_radius,
-            use_cnn, cnn_masks_dict.get(f), 
+            use_cnn, cnn_masks_dict.get(f), tmrm_max_range,
             save_qc_nuclei, save_qc_mtg, save_qc_tmrm, save_qc_composite, save_qc_cnn
         ))
 
@@ -872,7 +887,7 @@ def process_plate_directory(
             if res: all_cell_data.extend(res)
 
     if all_cell_data:
-        aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map)
+        aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, tmrm_max_range=tmrm_max_range)
 
 
 # ==========================================
@@ -895,9 +910,9 @@ if __name__ == "__main__":
         data_dir=data_path, output_paths_dict=paths_dict, treatment_map=treatment_dictionary,
         target_channel="1", tmrm_channel="2", nuclei_channel="0", 
         use_cnn=True, cnn_model_path=cnn_model_file,
-        sigma=1.5, tophat_radius=6, test_well=None,
-        use_watershed=True, nuclei_mask_method='otsu', cyto_expansion=80, mito_buffer=20, min_cyto=20, boundary_smoothing=3,
-        mask_method='triangle', cnn_noise_filter_radius=10,
+        sigma=1.0, tophat_radius=6, test_well=None,
+        use_watershed=True, nuclei_mask_method='triangle', cyto_expansion=80, mito_buffer=20, min_cyto=20, boundary_smoothing=3,
+        mask_method='triangle', cnn_noise_filter_radius=10, tmrm_max_range=0.25,
         save_qc_nuclei=True, save_qc_mtg=True, save_qc_tmrm=True, save_qc_composite=True, save_qc_cnn=True,
         plot_only=False, master_csv_path=existing_csv_path
     )
