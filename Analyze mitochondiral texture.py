@@ -5,12 +5,17 @@ import glob
 import textwrap
 import numpy as np
 import pandas as pd
-import seaborn as sns
 import scipy.ndimage as ndi
 from scipy import stats
+
+# force non-interactive backend to prevent Tkinter Tcl thread crashes
+import matplotlib
+matplotlib.use('Agg')
+
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import matplotlib.colors as mcolors
+import seaborn as sns
 from skimage import io, filters, feature, exposure, morphology, color, segmentation, measure
 from matplotlib.colors import LinearSegmentedColormap
 from tqdm import tqdm
@@ -185,8 +190,8 @@ def define_cell_territories(img_hoechst, nuclei_labels, mask_mtg, out_folder, ba
     if mask_mtg is not None:
         mito_footprint |= mask_mtg
         
-    flow_channel = morphology.binary_dilation(mito_footprint, morphology.disk(3))
-    mito_envelope = morphology.binary_dilation(mito_footprint, morphology.disk(mito_buffer))
+    flow_channel = morphology.dilation(mito_footprint, morphology.disk(3))
+    mito_envelope = morphology.dilation(mito_footprint, morphology.disk(mito_buffer))
     base_cyto = segmentation.expand_labels(nuclei_labels, distance=min_cyto) > 0
     valid_area = mito_envelope | base_cyto
     max_bound = segmentation.expand_labels(nuclei_labels, distance=cyto_expansion) > 0
@@ -197,8 +202,8 @@ def define_cell_territories(img_hoechst, nuclei_labels, mask_mtg, out_folder, ba
     topography = (dist_from_mito * 10.0) + dist_from_nuc
 
     if boundary_smoothing > 0:
-        flood_mask = morphology.binary_opening(
-            morphology.binary_closing(flood_mask, morphology.disk(boundary_smoothing)), 
+        flood_mask = morphology.opening(
+            morphology.closing(flood_mask, morphology.disk(boundary_smoothing)), 
             morphology.disk(boundary_smoothing)
         )
         topography = filters.gaussian(topography, sigma=boundary_smoothing)
@@ -387,12 +392,12 @@ def save_skeleton_overlay_qc(img_base, mask_mtg, cell_labels, skeleton, branches
         bound_rgba[boundaries] = [255, 255, 255, int(0.6 * 255)]
         ax.imshow(bound_rgba)
         
-    skel_dilated = morphology.binary_dilation(skeleton, morphology.disk(1))
+    skel_dilated = morphology.dilation(skeleton, morphology.disk(1))
     cyan_rgba = np.zeros((*img_base.shape, 4), dtype=np.uint8)
     cyan_rgba[skel_dilated] = [0, 255, 255, 255]
     ax.imshow(cyan_rgba)
     
-    branch_dilated = morphology.binary_dilation(branches, morphology.disk(2))
+    branch_dilated = morphology.dilation(branches, morphology.disk(2))
     yellow_rgba = np.zeros((*img_base.shape, 4), dtype=np.uint8)
     yellow_rgba[branch_dilated] = [255, 255, 0, 255]
     ax.imshow(yellow_rgba)
@@ -483,7 +488,7 @@ def _worker_process_field(args):
         if cnn_noise_filter_radius > 0:
             traditional_mask = get_mask(img_tophat, sigma=2.0, method=mask_method)
             selem = morphology.disk(cnn_noise_filter_radius)
-            valid_regions = morphology.binary_dilation(traditional_mask, footprint=selem)
+            valid_regions = morphology.dilation(traditional_mask, footprint=selem)
             mask_mtg = mask_mtg & valid_regions
 
         if save_qc_cnn:
@@ -693,6 +698,8 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
         ax.set_title(title, fontsize=14, fontweight='bold')
         ax.tick_params(axis='x', rotation=45)
         
+        # proper fix for the ticklabels warning
+        ax.set_xticks(ax.get_xticks())
         labels = [item.get_text() for item in ax.get_xticklabels()]
         wrapped_labels = ['\n'.join(textwrap.wrap(label, width=20)) for label in labels]
         ax.set_xticklabels(wrapped_labels, rotation=45, ha='right', fontsize=9)
@@ -716,9 +723,7 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
     X = df_cells[feature_cols].fillna(0).values
     
     # log(x + 1) transform to normalize skewed distributions (like area/intensity) before pca
-    # clip safely at 0 to avoid log warnings in case of infinitesimal floating point negatives
     X_log = np.log1p(np.clip(X, a_min=0, a_max=None))
-    
     X_scaled = StandardScaler().fit_transform(X_log)
     
     # pca preprocessing
@@ -770,8 +775,94 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
     plt.tight_layout()
     plt.savefig(os.path.join(parent_out_dir, "UMAP_SingleCell_Clusters_Treatment.png"), dpi=300, bbox_inches='tight')
     plt.close(fig_umap)
+
+    # ----------------------------------------------------
+    # 3. Targeted UMAP Highlights per Condition
+    # ----------------------------------------------------
+    print("Generating condition-specific UMAP highlights...")
+    umap_hl_dir = os.path.join(parent_out_dir, "UMAP_Condition_Highlights")
+    os.makedirs(umap_hl_dir, exist_ok=True)
+
+    palette = sns.color_palette("husl", len(conditions))
+    cond_colors = dict(zip(conditions, palette))
+
+    for cond in conditions:
+        fig_hl, ax_hl = plt.subplots(figsize=(10, 8))
+        
+        # plot all other conditions as transparent grey background
+        mask_other = df_umap_meta['Treatment'] != cond
+        ax_hl.scatter(df_umap_meta.loc[mask_other, 'UMAP1'], df_umap_meta.loc[mask_other, 'UMAP2'], 
+                      c='grey', s=3, alpha=0.05, edgecolors='none', zorder=1)
+        
+        # plot targeted condition on top
+        mask_target = df_umap_meta['Treatment'] == cond
+        ax_hl.scatter(df_umap_meta.loc[mask_target, 'UMAP1'], df_umap_meta.loc[mask_target, 'UMAP2'], 
+                      c=[cond_colors[cond]], s=8, alpha=0.8, edgecolors='none', zorder=2, label=cond)
+        
+        ax_hl.set_title(f"UMAP Highlight: {cond}", fontweight='bold')
+        ax_hl.set_xlabel('UMAP1')
+        ax_hl.set_ylabel('UMAP2')
+        ax_hl.legend(loc='upper right', markerscale=2)
+        
+        safe_cond = str(cond).replace(" ", "_").replace("/", "_").replace("+", "plus")
+        plt.tight_layout()
+        plt.savefig(os.path.join(umap_hl_dir, f"UMAP_Highlight_{safe_cond}.png"), dpi=300, bbox_inches='tight')
+        plt.close(fig_hl)
+
+    # ----------------------------------------------------
+    # 4. Point-Biserial Correlations & Barplots
+    # ----------------------------------------------------
+    print("Calculating correlations between features and conditions...")
+    corr_dir = os.path.join(parent_out_dir, "Treatment_Correlations")
+    os.makedirs(corr_dir, exist_ok=True)
+
+    corr_results = []
     
-    # umap viridis overlays for all physical metrics
+    # calculate point-biserial correlation for every continuous feature against binary condition presence
+    for cond in conditions:
+        y_bin = (df_umap_meta['Treatment'] == cond).astype(float).values
+        # if the dataset has extremely low variance for a condition, skip to avoid division by zero
+        if np.std(y_bin) == 0:
+            continue
+            
+        for feature in feature_cols:
+            feat_vals = df_umap_meta[feature].fillna(0).values
+            if np.std(feat_vals) == 0:
+                corr = 0
+            else:
+                corr, _ = stats.pointbiserialr(y_bin, feat_vals)
+                
+            corr_results.append({
+                'Condition': cond,
+                'Feature': feature,
+                'Correlation': corr
+            })
+            
+    df_corr = pd.DataFrame(corr_results)
+
+    # generate sorted horizontal barplots for each feature
+    for feature in feature_cols:
+        feat_data = df_corr[df_corr['Feature'] == feature].copy()
+        if feat_data.empty: continue
+            
+        feat_data = feat_data.sort_values(by='Correlation', ascending=False)
+        
+        fig_bar, ax_bar = plt.subplots(figsize=(10, max(6, len(conditions) * 0.4)))
+        sns.barplot(data=feat_data, x='Correlation', y='Condition', ax=ax_bar, palette=cond_colors, hue='Condition', legend=False)
+        
+        ax_bar.axvline(0, color='black', linewidth=1)
+        ax_bar.set_title(f"Correlation: Treatment vs {feature}\n(>0 means treatment increases this feature)", fontweight='bold')
+        ax_bar.set_xlabel("Point-Biserial Correlation Coefficient (r)")
+        ax_bar.set_ylabel("")
+        
+        safe_fname = str(feature).replace(" ", "_").replace("/", "_").replace("(", "").replace(")", "")
+        plt.tight_layout()
+        plt.savefig(os.path.join(corr_dir, f"Corr_Barplot_{safe_fname}.png"), dpi=300, bbox_inches='tight')
+        plt.close(fig_bar)
+
+    # ----------------------------------------------------
+    # 5. UMAP viridis overlays for all physical metrics
+    # ----------------------------------------------------
     print("Generating feature-colored UMAP overlays (viridis)...")
     umap_dir = os.path.join(parent_out_dir, "UMAP_Features")
     os.makedirs(umap_dir, exist_ok=True)
@@ -793,7 +884,7 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
         plt.savefig(os.path.join(umap_dir, f"UMAP_{safe_fname}.png"), dpi=300, bbox_inches='tight')
         plt.close(fig)
 
-    print("PCA and UMAP generation complete.")
+    print("PCA, UMAP, and Correlation generation complete.")
     
 def process_plate_directory(
     data_dir, output_paths_dict, treatment_map, 
