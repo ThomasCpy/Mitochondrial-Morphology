@@ -20,7 +20,7 @@ import concurrent.futures
 import gc
 import umap.umap_ as umap
 from sklearn.preprocessing import StandardScaler
-
+from sklearn.decomposition import PCA
 
 # ==========================================
 # IO AND SETUP
@@ -161,7 +161,6 @@ def segment_nuclei(img, min_nucleus_area=500, use_watershed=False, method='trian
         thresh = filters.threshold_otsu(img_smoothed)
         
     mask = img_smoothed > thresh
-    
     mask_cleaned = morphology.remove_small_objects(mask, max_size=min_nucleus_area)
     
     if use_watershed:
@@ -291,6 +290,20 @@ def generate_cnn_mask_sequential(img, sess, input_name, patch_h, patch_w, suppre
     
     return mask
 
+def get_skeleton_and_branches(mask_mtg):
+    """extracts pure skeleton and intersection points via fast localized convolution, dodging external libraries"""
+    skeleton = morphology.skeletonize(mask_mtg)
+    
+    # 3x3 neighbor convolution to easily locate branch intersections
+    kernel = np.array([[1, 1, 1],
+                       [1, 0, 1],
+                       [1, 1, 1]])
+    neighbor_count = ndi.convolve(skeleton.astype(int), kernel, mode='constant')
+    
+    # an intersection in a 1px skeleton generally has > 2 adjacent pixels
+    branches = skeleton & (neighbor_count >= 3)
+    return skeleton, branches
+
 # ==========================================
 # QUALITY CONTROL AND METRICS
 # ==========================================
@@ -358,6 +371,39 @@ def save_master_overlay_qc(img_base, mask_hoechst, mask_mtg, cell_labels, img_tm
     fig.clf()
     plt.close('all')
 
+def save_skeleton_overlay_qc(img_base, mask_mtg, cell_labels, skeleton, branches, out_folder, base_name):
+    """composite image showing base clahe, mtg mask, cell boundaries, cyan skeleton (2px) and yellow branches (4px diameter)"""
+    fig, ax = plt.subplots(figsize=(10, 10))
+    ax.imshow(img_base, cmap='gray')
+    
+    if mask_mtg is not None:
+        green_rgba = np.zeros((*img_base.shape, 4), dtype=np.uint8)
+        green_rgba[mask_mtg] = [0, 128, 0, int(0.3 * 255)]
+        ax.imshow(green_rgba)
+        
+    if cell_labels is not None:
+        boundaries = segmentation.find_boundaries(cell_labels, mode='inner')
+        bound_rgba = np.zeros((*img_base.shape, 4), dtype=np.uint8)
+        bound_rgba[boundaries] = [255, 255, 255, int(0.6 * 255)]
+        ax.imshow(bound_rgba)
+        
+    skel_dilated = morphology.binary_dilation(skeleton, morphology.disk(1))
+    cyan_rgba = np.zeros((*img_base.shape, 4), dtype=np.uint8)
+    cyan_rgba[skel_dilated] = [0, 255, 255, 255]
+    ax.imshow(cyan_rgba)
+    
+    branch_dilated = morphology.binary_dilation(branches, morphology.disk(2))
+    yellow_rgba = np.zeros((*img_base.shape, 4), dtype=np.uint8)
+    yellow_rgba[branch_dilated] = [255, 255, 0, 255]
+    ax.imshow(yellow_rgba)
+    
+    ax.axis('off')
+    ax.set_title('Skeleton Network QC: Cyan=2px Backbone, Yellow=4px Branches')
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_folder, f"{base_name}_skeleton_QC.png"), dpi=300, bbox_inches='tight')
+    fig.clf()
+    plt.close('all')
+
 def calculate_morphology(img_base, mask, sigma=0.8):
     """calculates continuous tubularity index from hessian eigenvalues (0.0 to 1.0)"""
     H_elems = feature.hessian_matrix(img_base, sigma=sigma, order='rc', use_gaussian_derivatives=True)
@@ -412,7 +458,7 @@ def _worker_process_field(args):
      tmrm_channel, nuclei_channel, sigma, tophat_radius, 
      use_watershed, nuclei_mask_method, cyto_expansion, mito_buffer, min_cyto, boundary_smoothing, mask_method, cnn_noise_filter_radius,
      use_cnn, precomputed_mask, tmrm_max_range, tmrm_threshold,
-     save_qc_nuclei, save_qc_mtg, save_qc_tmrm, save_qc_composite, save_qc_cnn) = args
+     save_qc_nuclei, save_qc_mtg, save_qc_tmrm, save_qc_composite, save_qc_cnn, save_qc_skeleton) = args
     
     well_out_dir = output_paths_dict.get(well_id)
     if not well_out_dir: return None
@@ -476,78 +522,92 @@ def _worker_process_field(args):
         os.makedirs(qc_comp_dir, exist_ok=True)
         save_master_overlay_qc(img_clahe, mask_hoechst, mask_mtg, cell_labels, img_tmrm, qc_comp_dir, base_filename)
 
+    # get skeleton structure for the entire field once to save time
+    field_skeleton, field_branches = get_skeleton_and_branches(mask_mtg)
+    
+    if save_qc_skeleton and mask_mtg is not None:
+        qc_skel_dir = os.path.join(well_out_dir, "Network Skeleton QC")
+        os.makedirs(qc_skel_dir, exist_ok=True)
+        save_skeleton_overlay_qc(img_clahe, mask_mtg, cell_labels, field_skeleton, field_branches, qc_skel_dir, base_filename)
+
     cell_records = []
     if cell_count > 0 and cell_labels is not None:
-        props_cells = measure.regionprops(cell_labels)
-        area_dict = {p.label: p.area for p in props_cells}
+        # compute field-wide properties for "chunkiness" and "density" metrics
+        mtg_thickness = ndi.distance_transform_edt(mask_mtg)
+        dist_to_nuc = ndi.distance_transform_edt(nuclei_labels == 0)
         
-        props_nuc = measure.regionprops(nuclei_labels)
-        nuc_area_dict = {p.label: p.area for p in props_nuc}
-        
-        mtg_labels = cell_labels * mask_mtg
-        props_morph = measure.regionprops(mtg_labels, intensity_image=smoothed_index)
-        
-        tmrm_dict = {}
-        if img_tmrm is not None:
-            props_tmrm = measure.regionprops(mtg_labels, intensity_image=img_tmrm)
-            tmrm_dict = {p.label: p.intensity_image[p.image] for p in props_tmrm}
+        # unique cells
+        for c_id in range(1, cell_count + 1):
+            cell_mtg_mask = (cell_labels == c_id) & mask_mtg
+            cell_nuc_mask = (nuclei_labels == c_id)
             
-        mtg_raw_dict = {}
-        if img_mtg is not None:
-            props_mtg_raw = measure.regionprops(mtg_labels, intensity_image=img_mtg)
-            mtg_raw_dict = {p.label: p.intensity_image[p.image] for p in props_mtg_raw}
+            mtg_area = np.sum(cell_mtg_mask)
+            hoechst_area = np.sum(cell_nuc_mask)
             
-        mtg_bin_size = 1.0 / 20.0
-        tmrm_bin_size = tmrm_max_range / 20.0
-        morph_bin_size = 1.0 / 20.0
-        
-        for prop in props_morph:
-            c_id = prop.label
-            morph_vals = prop.intensity_image[prop.image]
-            
-            if len(morph_vals) == 0: continue
-            
-            mtg_px = len(morph_vals)
-            mean_morph = np.mean(morph_vals)
-            mean_spottiness = 1.0 - mean_morph
-            
-            hist_morph, _ = np.histogram(morph_vals, bins=20, range=(0.0, 1.0))
-            
-            t_vals = tmrm_dict.get(c_id, np.array([]))
-            if len(t_vals) > 0:
-                hist_tmrm, _ = np.histogram(t_vals, bins=20, range=(0.0, tmrm_max_range))
-                overlap_pct = np.mean(t_vals > tmrm_threshold) * 100.0
-            else:
-                hist_tmrm = np.zeros(20)
-                overlap_pct = 0.0
+            if mtg_area == 0: continue
                 
-            m_raw_vals = mtg_raw_dict.get(c_id, np.array([]))
-            if len(m_raw_vals) > 0:
-                hist_mtg, _ = np.histogram(m_raw_vals, bins=20, range=(0.0, 1.0))
-            else:
-                hist_mtg = np.zeros(20)
+            tmrm_area = np.sum((img_tmrm > tmrm_threshold) & cell_mtg_mask) if img_tmrm is not None else 0
+            
+            mtg_intensity = np.sum(img_mtg[cell_mtg_mask]) if img_mtg is not None else 0
+            tmrm_intensity = np.sum(img_tmrm[cell_mtg_mask]) if img_tmrm is not None else 0
+            hoechst_intensity = np.sum(img_hoechst[cell_nuc_mask]) if img_hoechst is not None else 0
+            
+            tmrm_percent = (tmrm_area / mtg_area * 100.0) if mtg_area > 0 else 0.0
+            
+            # extract morphology indices
+            morph_vals = smoothed_index[cell_mtg_mask]
+            mean_tubularness = np.mean(morph_vals)
+            median_tubularness = np.median(morph_vals)
+            
+            # calculate bins directly as arrays and store them stringified (keeps the CSV strictly at 1 column per requirement)
+            hist_morph, _ = np.histogram(morph_vals, bins=20, range=(0.0, 1.0))
+            t_vals = img_tmrm[cell_mtg_mask] if img_tmrm is not None else np.array([])
+            hist_tmrm, _ = np.histogram(t_vals, bins=20, range=(0.0, tmrm_max_range)) if len(t_vals) > 0 else (np.zeros(20), 0)
+            m_raw_vals = img_mtg[cell_mtg_mask] if img_mtg is not None else np.array([])
+            hist_mtg, _ = np.histogram(m_raw_vals, bins=20, range=(0.0, 1.0)) if len(m_raw_vals) > 0 else (np.zeros(20), 0)
+            
+            # network density and chunkiness
+            density_nucleus = np.mean(dist_to_nuc[cell_mtg_mask])
+            chunkiness = np.mean(mtg_thickness[cell_mtg_mask])
+            
+            # skeleton properties for this cell
+            cell_skel = field_skeleton & cell_mtg_mask
+            cell_branches = field_branches & cell_mtg_mask
+            skel_length = np.sum(cell_skel)
+            num_branches = np.sum(cell_branches)
+            
+            cell_segments = cell_skel ^ cell_branches
+            labeled_segs, num_segs = ndi.label(cell_segments)
+            seg_lens = [np.sum(labeled_segs == i) for i in range(1, num_segs + 1)]
+            avg_seg_len = np.mean(seg_lens) if seg_lens else 0
+            med_seg_len = np.median(seg_lens) if seg_lens else 0
             
             global_id = f"{well_id}_f{field_id}_c{c_id}"
             
             record = {
-                "UID": global_id,
-                "Well": well_id, 
-                "Field": field_id, 
                 "Treatment": "Unknown", 
-                "Local_Cell_ID": c_id,
-                "Area": area_dict.get(c_id, 0),
-                "Nuclear_Area": nuc_area_dict.get(c_id, 0),
-                "Total_MTG_Pixels": mtg_px,
-                "TMRM_Above_Threshold_Pct": overlap_pct,
-                "Mean_Tubularness": mean_morph,
-                "Mean_Spottiness": mean_spottiness
+                "Field": field_id, 
+                "Well": well_id, 
+                "UID": global_id,
+                "Skeleton network total length": skel_length,
+                "Skeleton number of branching": num_branches,
+                "Skeleton Average segment length": avg_seg_len,
+                "Skeleton median segment length": med_seg_len,
+                "MTG total area (px count)": mtg_area,
+                "TMRM total area (px count)": tmrm_area,
+                "Hoechst total area (px count)": hoechst_area,
+                "MTG total intensity (px intensity sum in the MTG mask area)": mtg_intensity,
+                "TMRM total intensity (px intensity in the MTG mask area)": tmrm_intensity,
+                "Hoechst total intensity (px intensity sum in the cell count mask area)": hoechst_intensity,
+                "percent TMRM pixels in MTG mask above threshold": tmrm_percent,
+                "Bins TMRM for intensity continuous plotting": str(hist_tmrm.tolist()),
+                "Bins tubularness for intensity continuous plotting": str(hist_morph.tolist()),
+                "Bins MTG for intensity continuous plotting": str(hist_mtg.tolist()),
+                "Mean tubularness in MTG mask": mean_tubularness,
+                "Median tubularness in MTG mask": median_tubularness,
+                "Density of the network around the nuclei": density_nucleus,
+                "Chunkiness": chunkiness
             }
-            
-            for b in range(20):
-                record[f"Tubularness_Bin_Size_{morph_bin_size:.2f}_Idx_{b+1:02d}"] = hist_morph[b]
-                record[f"MTG_RawInt_Bin_Size_{mtg_bin_size:.2f}_Idx_{b+1:02d}"] = hist_mtg[b]
-                record[f"TMRM_RawInt_Bin_Size_{tmrm_bin_size:.3f}_Idx_{b+1:02d}"] = hist_tmrm[b]
-                
             cell_records.append(record)
 
     return cell_records
@@ -581,8 +641,8 @@ def add_stat_annotation(ax, data, x_col, y_col, ref_cond):
             ax.text((ref_idx + i) / 2, current_y + step/3, stars, ha='center', va='bottom', color='k')
             current_y += step * 1.5
 
-def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv_path_override=None, tmrm_max_range=0.25, plot_as_density=True):
-    """saves single-cell data, runs tight UMAP and generates feature-colored plots"""
+def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv_path_override=None, tmrm_max_range=0.25, pca_variance_threshold=0.95):
+    """saves single-cell data, runs PCA + tight UMAP and generates feature-colored plots"""
     if csv_path_override and os.path.exists(csv_path_override):
         df_cells = pd.read_csv(csv_path_override)
         parent_out_dir = os.path.dirname(csv_path_override)
@@ -595,11 +655,12 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
         df_cells['Treatment'] = df_cells['Well'].map(treatment_map).fillna("Untreated")
         
         csv_path = os.path.join(parent_out_dir, "Single_Cell_Properties.csv")
-        cols = ['UID', 'Well', 'Field', 'Treatment'] + [c for c in df_cells.columns if c not in ['UID', 'Well', 'Field', 'Treatment']]
+        # enforce ordered columns explicitly based on the extracted fields
+        cols = ['Treatment', 'Field', 'Well', 'UID'] + [c for c in df_cells.columns if c not in ['Treatment', 'Field', 'Well', 'UID']]
         df_cells = df_cells[cols]
         
         df_cells.to_csv(csv_path, index=False)
-        print(f"\nExported single-cell master dataset to: {csv_path}")
+        print(f"\nExported rational single-cell master dataset to: {csv_path}")
 
     sns.set_style("whitegrid")
     conditions = sorted(df_cells['Treatment'].unique())
@@ -609,14 +670,12 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
     # 1. Boxplot Analytics (Aggregated per Well)
     # ----------------------------------------------------
     well_df = df_cells.groupby(['Well', 'Treatment']).agg(
-        Median_Tubularness=('Mean_Tubularness', 'median'),
-        Median_Spottiness=('Mean_Spottiness', 'median'),
-        Average_Cell_Size=('Area', 'mean')
+        Median_Tubularness=('Median tubularness in MTG mask', 'median'),
+        Average_Cell_Size=('Hoechst total area (px count)', 'mean')
     ).reset_index()
 
     metrics = [
         ('Median_Tubularness', 'Median Tubularness per Well', '#0072B2'),
-        ('Median_Spottiness', 'Median Spottiness per Well', 'orange'),
         ('Average_Cell_Size', 'Average Cell Size (px) per Well', 'brown')
     ]
     
@@ -643,32 +702,61 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
         plt.close(fig)
 
     # ----------------------------------------------------
-    # 2. UMAP Dimensionality Reduction (Tightly Clustered)
+    # 2. PCA and UMAP Dimensionality Reduction
     # ----------------------------------------------------
-    print("\nRunning UMAP dimensionality reduction on single-cell data...")
-    exclude_cols = ['UID', 'Well', 'Field', 'Treatment', 'Local_Cell_ID']
+    print("\nRunning PCA + UMAP dimensionality reduction on single-cell data...")
+    exclude_cols = [
+        'Treatment', 'Field', 'Well', 'UID', 
+        'Bins TMRM for intensity continuous plotting',
+        'Bins tubularness for intensity continuous plotting',
+        'Bins MTG for intensity continuous plotting'
+    ]
     feature_cols = [c for c in df_cells.columns if c not in exclude_cols]
     
     X = df_cells[feature_cols].fillna(0).values
     X_scaled = StandardScaler().fit_transform(X)
     
+    # pca preprocessing
+    pca = PCA()
+    pca.fit(X_scaled)
+    exp_var = pca.explained_variance_ratio_
+    cum_var = np.cumsum(exp_var)
+    n_components_threshold = np.argmax(cum_var >= pca_variance_threshold) + 1
+    
+    # log scree plot
+    fig_scree, ax_scree = plt.subplots(figsize=(8, 6))
+    ax_scree.plot(range(1, len(exp_var) + 1), exp_var, marker='o', linestyle='-')
+    ax_scree.set_yscale('log')
+    ax_scree.axvline(x=n_components_threshold, color='red', linestyle='--', 
+                     label=f'>={pca_variance_threshold*100:.0f}% variance ({n_components_threshold} PCs)')
+    ax_scree.set_xlabel('Principal Component')
+    ax_scree.set_ylabel('Explained Variance Ratio (Log Scale)')
+    ax_scree.set_title('PCA Scree Plot')
+    ax_scree.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(parent_out_dir, "PCA_Scree_Plot.png"), dpi=300)
+    plt.close(fig_scree)
+    
+    # pca transform to inject into umap
+    X_pca = pca.transform(X_scaled)[:, :n_components_threshold]
+    
     max_cells = 50000
     if len(df_cells) > max_cells:
         print(f"Sampling {max_cells} cells for UMAP to save memory...")
         sample_idx = np.random.choice(len(df_cells), max_cells, replace=False)
-        X_scaled = X_scaled[sample_idx]
+        X_pca_sampled = X_pca[sample_idx]
         df_umap_meta = df_cells.iloc[sample_idx].copy()
     else:
+        X_pca_sampled = X_pca
         df_umap_meta = df_cells.copy()
     
-    # MODIFIED: Reduced min_dist and increased n_neighbors for tighter, solid clusters
     reducer = umap.UMAP(n_neighbors=50, min_dist=0.01, random_state=42)
-    embedding = reducer.fit_transform(X_scaled)
+    embedding = reducer.fit_transform(X_pca_sampled)
     
     df_umap_meta['UMAP1'] = embedding[:, 0]
     df_umap_meta['UMAP2'] = embedding[:, 1]
     
-    # --- A. Main UMAP by Treatment ---
+    # main umap by treatment
     fig_umap, ax_umap = plt.subplots(figsize=(10, 8))
     sns.scatterplot(data=df_umap_meta, x='UMAP1', y='UMAP2', hue='Treatment', s=5, alpha=0.6, edgecolor=None, ax=ax_umap)
     ax_umap.set_title("Single-Cell UMAP (Treatment Clusters)", fontweight='bold')
@@ -678,7 +766,7 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
     plt.savefig(os.path.join(parent_out_dir, "UMAP_SingleCell_Clusters_Treatment.png"), dpi=300, bbox_inches='tight')
     plt.close(fig_umap)
     
-    # --- B. UMAPs colored by every feature (Viridis) ---
+    # umap viridis overlays for all physical metrics
     print("Generating feature-colored UMAP overlays (viridis)...")
     umap_dir = os.path.join(parent_out_dir, "UMAP_Features")
     os.makedirs(umap_dir, exist_ok=True)
@@ -686,7 +774,6 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
     for feature in tqdm(feature_cols, desc="Saving Feature UMAPs"):
         fig, ax = plt.subplots(figsize=(10, 8))
         
-        # Plot continuous values using scatter and viridis
         sc = ax.scatter(df_umap_meta['UMAP1'], df_umap_meta['UMAP2'],
                         c=df_umap_meta[feature], cmap='viridis', s=5, alpha=0.6, edgecolors='none')
         
@@ -695,14 +782,13 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
         ax.set_xlabel('UMAP1')
         ax.set_ylabel('UMAP2')
         
-        # Clean feature name for saving to disk
-        safe_fname = str(feature).replace(" ", "_").replace("/", "_")
+        safe_fname = str(feature).replace(" ", "_").replace("/", "_").replace("(", "").replace(")", "")
         
         plt.tight_layout()
         plt.savefig(os.path.join(umap_dir, f"UMAP_{safe_fname}.png"), dpi=300, bbox_inches='tight')
         plt.close(fig)
 
-    print("UMAP generation complete.")
+    print("PCA and UMAP generation complete.")
     
 def process_plate_directory(
     data_dir, output_paths_dict, treatment_map, 
@@ -710,14 +796,14 @@ def process_plate_directory(
     sigma=1.0, tophat_radius=5, test_well=None,
     use_watershed=False, nuclei_mask_method='triangle', cyto_expansion=80, mito_buffer=20, min_cyto=20, boundary_smoothing=3,
     mask_method='triangle', cnn_noise_filter_radius=25,
-    use_cnn=False, cnn_model_path=None, tmrm_max_range=0.25, tmrm_threshold=0.05, plot_as_density=True,
-    save_qc_nuclei=True, save_qc_mtg=True, save_qc_tmrm=True, save_qc_composite=True, save_qc_cnn=True,
+    use_cnn=False, cnn_model_path=None, tmrm_max_range=0.25, tmrm_threshold=0.05, pca_variance_threshold=0.95,
+    save_qc_nuclei=True, save_qc_mtg=True, save_qc_tmrm=True, save_qc_composite=True, save_qc_cnn=True, save_qc_skeleton=True,
     plot_only=False, master_csv_path=None
 ):
     if plot_only:
         if master_csv_path and os.path.exists(master_csv_path):
             print("\n--- phase: plotting only (skipping image extraction) ---")
-            aggregate_and_plot_data(None, None, None, csv_path_override=master_csv_path, tmrm_max_range=tmrm_max_range, plot_as_density=plot_as_density)
+            aggregate_and_plot_data(None, None, None, csv_path_override=master_csv_path, tmrm_max_range=tmrm_max_range, pca_variance_threshold=pca_variance_threshold)
             return
         else:
             print(f"\n[!] Notice: plot_only is True, but no existing dataset was found at: {master_csv_path}")
@@ -787,11 +873,12 @@ def process_plate_directory(
             sigma, tophat_radius, use_watershed, nuclei_mask_method,
             cyto_expansion, mito_buffer, min_cyto, boundary_smoothing, mask_method, cnn_noise_filter_radius,
             use_cnn, cnn_masks_dict.get(f), tmrm_max_range, tmrm_threshold,
-            save_qc_nuclei, save_qc_mtg, save_qc_tmrm, save_qc_composite, save_qc_cnn
+            save_qc_nuclei, save_qc_mtg, save_qc_tmrm, save_qc_composite, save_qc_cnn, save_qc_skeleton
         ))
 
     all_cell_data = []
-    max_workers = min(os.cpu_count() - 1, len(tasks)) if os.cpu_count() else 1
+    # mobilizing all available CPU cores securely
+    max_workers = os.cpu_count() if os.cpu_count() else 1
     
     print(f"Spawning {max_workers} isolated processes...")
     with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
@@ -801,7 +888,7 @@ def process_plate_directory(
             if res: all_cell_data.extend(res)
 
     if all_cell_data:
-        aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, tmrm_max_range=tmrm_max_range, plot_as_density=plot_as_density)
+        aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, tmrm_max_range=tmrm_max_range, pca_variance_threshold=pca_variance_threshold)
 
 
 # ==========================================
@@ -814,7 +901,6 @@ if __name__ == "__main__":
     dtt_path = "C:/Users/lab/OneDrive - Vandria/Bureau/Morphology/Drug treatment plate 3.tdd"
     cnn_model_file = r"C:/Users/lab/OneDrive - Vandria/Bureau/Morphology/MitoSegNet_model.onnx"
     
-    # Cleaned up duplicate assignments from the original script
     out_dir, paths_dict = setup_output(base_dir, "Output Images plate", zero_pad=True)
     treatment_dictionary = parse_tecan_d300e_xml(dtt_path)
     existing_csv_path = os.path.join(out_dir, "Single_Cell_Properties.csv")
@@ -825,8 +911,8 @@ if __name__ == "__main__":
         use_cnn=True, cnn_model_path=cnn_model_file,
         sigma=1.0, tophat_radius=6, test_well=None,
         use_watershed=True, nuclei_mask_method='triangle', cyto_expansion=80, mito_buffer=20, min_cyto=20, boundary_smoothing=3,
-        mask_method='triangle', cnn_noise_filter_radius=10, tmrm_max_range=0.25, tmrm_threshold=0.05, plot_as_density=True,
-        save_qc_nuclei=True, save_qc_mtg=True, save_qc_tmrm=True, save_qc_composite=True, save_qc_cnn=True,
+        mask_method='triangle', cnn_noise_filter_radius=10, tmrm_max_range=0.25, tmrm_threshold=0.05, pca_variance_threshold=0.95,
+        save_qc_nuclei=True, save_qc_mtg=True, save_qc_tmrm=True, save_qc_composite=True, save_qc_cnn=True, save_qc_skeleton=True,
         plot_only=True, 
         master_csv_path=existing_csv_path
     )
