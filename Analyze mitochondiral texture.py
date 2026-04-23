@@ -714,7 +714,12 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
     feature_cols = [c for c in df_cells.columns if c not in exclude_cols]
     
     X = df_cells[feature_cols].fillna(0).values
-    X_scaled = StandardScaler().fit_transform(X)
+    
+    # log(x + 1) transform to normalize skewed distributions (like area/intensity) before pca
+    # clip safely at 0 to avoid log warnings in case of infinitesimal floating point negatives
+    X_log = np.log1p(np.clip(X, a_min=0, a_max=None))
+    
+    X_scaled = StandardScaler().fit_transform(X_log)
     
     # pca preprocessing
     pca = PCA()
