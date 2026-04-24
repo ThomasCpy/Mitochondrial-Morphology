@@ -7,8 +7,11 @@ import numpy as np
 import pandas as pd
 import scipy.ndimage as ndi
 from scipy import stats
+
+# force non-interactive backend to prevent Tkinter Tcl thread crashes
 import matplotlib
 matplotlib.use('Agg')
+
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import matplotlib.colors as mcolors
@@ -126,7 +129,7 @@ def parse_tecan_d300e_xml(file_path):
 def load_as_float(image_path):
     """
     loads image and forces float for safe math operations.
-    Dynamically estimates true hardware bit-depth ceiling to prevent crushing low-exposure images.
+    dynamically estimates true hardware bit-depth ceiling to prevent crushing low-exposure images.
     """
     if not os.path.exists(image_path):
         return None
@@ -255,7 +258,7 @@ def get_mask(img_tophat, sigma=2.0, method='triangle'):
     return mask
 
 def generate_cnn_mask_sequential(img, sess, input_name, patch_h, patch_w, suppress_output=False):
-    """applies the cnn using ONNX runtime and rational block-tiling"""
+    """applies the cnn using onnx runtime and rational block-tiling"""
     img_norm = (img - np.min(img)) / (np.max(img) - np.min(img) + 1e-8)
     img_8bit = (img_norm * 255).astype(np.float32)
 
@@ -327,7 +330,7 @@ def save_mask_visualisation(img, mask, out_folder, base_name, overlay_color='pur
     plt.close('all')
 
 def save_tmrm_mtg_overlay_qc(img_tmrm, mask_mtg, out_folder, base_name):
-    """visualizes physical overlap between TMRM intensities and MTG boundaries"""
+    """visualizes physical overlap between tmrm intensities and mtg boundaries"""
     fig, axes = plt.subplots(1, 2, figsize=(12, 6))
     axes[0].imshow(img_tmrm, cmap='magma'); axes[0].set_title('Raw TMRM Intensities'); axes[0].axis('off')
     
@@ -561,7 +564,7 @@ def _worker_process_field(args):
             mean_tubularness = np.mean(morph_vals)
             median_tubularness = np.median(morph_vals)
             
-            # calculate bins directly as arrays and store them stringified (keeps the CSV strictly at 1 column per requirement)
+            # calculate bins directly as arrays and store them stringified
             hist_morph, _ = np.histogram(morph_vals, bins=20, range=(0.0, 1.0))
             t_vals = img_tmrm[cell_mtg_mask] if img_tmrm is not None else np.array([])
             hist_tmrm, _ = np.histogram(t_vals, bins=20, range=(0.0, tmrm_max_range)) if len(t_vals) > 0 else (np.zeros(20), 0)
@@ -644,7 +647,7 @@ def add_stat_annotation(ax, data, x_col, y_col, ref_cond):
             current_y += step * 1.5
 
 def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv_path_override=None, tmrm_max_range=0.25, pca_variance_threshold=0.95):
-    """saves single-cell data, aggregates 75th percentiles per well, runs PCA + UMAP, and plots."""
+    """saves single-cell data, aggregates 75th percentiles per well, runs pca + umap, and plots."""
     if csv_path_override and os.path.exists(csv_path_override):
         df_cells = pd.read_csv(csv_path_override)
         parent_out_dir = os.path.dirname(csv_path_override)
@@ -668,7 +671,7 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
     conditions = sorted(df_cells['Treatment'].unique())
     ref_cond = "Vehicle" if "Vehicle" in conditions else conditions[0]
     
-    # identify numeric feature columns used for UMAP and aggregation
+    # identify numeric feature columns used for umap and aggregation
     exclude_cols = [
         'Treatment', 'Field', 'Well', 'UID', 
         'Bins TMRM for intensity continuous plotting',
@@ -678,18 +681,128 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
     feature_cols = [c for c in df_cells.columns if c not in exclude_cols]
 
     # ----------------------------------------------------
-    # 1. Well-Level Aggregation (75% Quantile)
+    # 1. Well-Level Aggregation (75% Quantile) & Well UMAP
     # ----------------------------------------------------
     print("\nCalculating 75th percentile (Q3) well-level aggregates...")
     well_agg_dir = os.path.join(parent_out_dir, "Well_Aggregates")
     os.makedirs(well_agg_dir, exist_ok=True)
     
-    # Calculate the 75% quantile for every physical feature, grouped by well
+    # calculate the 75% quantile for every physical feature, grouped by well
     well_75_df = df_cells.groupby(['Well', 'Treatment'])[feature_cols].quantile(0.75).reset_index()
     
-    agg_csv_path = os.path.join(well_agg_dir, "Well_75th_Percentiles.csv")
+    # calculate umap on the aggregated well data
+    print("Running UMAP on well-level 75th percentile aggregates...")
+    X_well = well_75_df[feature_cols].fillna(0).values
+    X_well_log = np.log1p(np.clip(X_well, a_min=0, a_max=None))
+    X_well_scaled = StandardScaler().fit_transform(X_well_log)
+    
+    # dynamically adjust n_neighbors for small datasets (96 wells max) to prevent crashes
+    n_neighbors_well = min(15, max(2, len(well_75_df) - 1))
+    
+    reducer_well = umap.UMAP(n_neighbors=n_neighbors_well, min_dist=0.01, random_state=42)
+    embedding_well = reducer_well.fit_transform(X_well_scaled)
+    
+    well_75_df['UMAP1'] = embedding_well[:, 0]
+    well_75_df['UMAP2'] = embedding_well[:, 1]
+    
+    agg_csv_path = os.path.join(well_agg_dir, "Well_75th_Percentiles_with_UMAP.csv")
     well_75_df.to_csv(agg_csv_path, index=False)
     print(f"Exported well-level 75% quantile data to: {agg_csv_path}")
+
+    # plot and save the well-level umap
+    fig_well_umap, ax_well_umap = plt.subplots(figsize=(10, 8))
+    sns.scatterplot(data=well_75_df, x='UMAP1', y='UMAP2', hue='Treatment', s=100, alpha=0.9, edgecolor='w', ax=ax_well_umap)
+    
+    # overlay well ids on the plot for direct rational inspection
+    for _, row in well_75_df.iterrows():
+        ax_well_umap.text(row['UMAP1'] + 0.1, row['UMAP2'] + 0.1, row['Well'], fontsize=8, alpha=0.7)
+
+    ax_well_umap.set_title("Well-Level UMAP (75th Percentile Aggregates)", fontweight='bold')
+    ax_well_umap.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(well_agg_dir, "UMAP_Well_Aggregates_Treatment.png"), dpi=300, bbox_inches='tight')
+    plt.close(fig_well_umap)
+
+    # ----------------------------------------------------
+    # 1.b Well-Level Feature UMAPs (Viridis)
+    # ----------------------------------------------------
+    print("Generating well-level feature-colored UMAP overlays (viridis)...")
+    well_umap_feat_dir = os.path.join(well_agg_dir, "UMAP_Features")
+    os.makedirs(well_umap_feat_dir, exist_ok=True)
+    
+    for feature in tqdm(feature_cols, desc="Saving Well Feature UMAPs"):
+        fig_wfeat, ax_wfeat = plt.subplots(figsize=(10, 8))
+        
+        sc_w = ax_wfeat.scatter(well_75_df['UMAP1'], well_75_df['UMAP2'],
+                                c=well_75_df[feature], cmap='viridis', s=100, alpha=0.9, edgecolors='w')
+        
+        # re-overlay well ids to track specific wells on the feature maps
+        for _, row in well_75_df.iterrows():
+            ax_wfeat.text(row['UMAP1'] + 0.1, row['UMAP2'] + 0.1, row['Well'], fontsize=8, alpha=0.7)
+
+        plt.colorbar(sc_w, ax=ax_wfeat, label=feature)
+        ax_wfeat.set_title(f"Well-Level UMAP Structure by: {feature}", fontweight='bold')
+        ax_wfeat.set_xlabel('UMAP1')
+        ax_wfeat.set_ylabel('UMAP2')
+        
+        safe_fname = str(feature).replace(" ", "_").replace("/", "_").replace("(", "").replace(")", "")
+        plt.tight_layout()
+        plt.savefig(os.path.join(well_umap_feat_dir, f"UMAP_Well_{safe_fname}.png"), dpi=300, bbox_inches='tight')
+        plt.close(fig_wfeat)
+
+    # ----------------------------------------------------
+    # 1.c Well-Level Point-Biserial Correlations
+    # ----------------------------------------------------
+    print("Calculating well-level correlations between features and conditions...")
+    well_corr_dir = os.path.join(well_agg_dir, "Treatment_Correlations")
+    os.makedirs(well_corr_dir, exist_ok=True)
+
+    corr_results_well = []
+    
+    # identify unique treatments safely, excluding vehicle from explicit bar calculations if desired, 
+    # but here we keep all for parity with single-cell
+    palette = sns.color_palette("husl", len(conditions))
+    cond_colors = dict(zip(conditions, palette))
+
+    for cond in conditions:
+        y_bin_well = (well_75_df['Treatment'] == cond).astype(float).values
+        if np.std(y_bin_well) == 0:
+            continue
+            
+        for feature in feature_cols:
+            feat_vals_w = well_75_df[feature].fillna(0).values
+            if np.std(feat_vals_w) == 0:
+                corr_w = 0
+            else:
+                corr_w, _ = stats.pointbiserialr(y_bin_well, feat_vals_w)
+                
+            corr_results_well.append({
+                'Condition': cond,
+                'Feature': feature,
+                'Correlation': corr_w
+            })
+            
+    df_corr_well = pd.DataFrame(corr_results_well)
+
+    for feature in feature_cols:
+        feat_data_w = df_corr_well[df_corr_well['Feature'] == feature].copy()
+        if feat_data_w.empty: continue
+            
+        feat_data_w = feat_data_w.sort_values(by='Correlation', ascending=False)
+        
+        fig_wbar, ax_wbar = plt.subplots(figsize=(10, max(6, len(conditions) * 0.4)))
+        sns.barplot(data=feat_data_w, x='Correlation', y='Condition', ax=ax_wbar, palette=cond_colors, hue='Condition', legend=False)
+        
+        ax_wbar.axvline(0, color='black', linewidth=1)
+        ax_wbar.set_title(f"Well-Level Correlation: Treatment vs {feature}\n(>0 means treatment increases this feature in Q3 cells)", fontweight='bold')
+        ax_wbar.set_xlabel("Point-Biserial Correlation Coefficient (r)")
+        ax_wbar.set_ylabel("")
+        
+        safe_fname = str(feature).replace(" ", "_").replace("/", "_").replace("(", "").replace(")", "")
+        plt.tight_layout()
+        plt.savefig(os.path.join(well_corr_dir, f"Corr_Well_Barplot_{safe_fname}.png"), dpi=300, bbox_inches='tight')
+        plt.close(fig_wbar)
 
     # ----------------------------------------------------
     # 2. Boxplot Analytics (Aggregated per Well)
@@ -728,7 +841,7 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
         plt.close(fig)
 
     # ----------------------------------------------------
-    # 3. PCA and UMAP Dimensionality Reduction
+    # 3. PCA and UMAP Dimensionality Reduction (Single Cell)
     # ----------------------------------------------------
     print("\nRunning PCA + UMAP dimensionality reduction on single-cell data...")
     X = df_cells[feature_cols].fillna(0).values
