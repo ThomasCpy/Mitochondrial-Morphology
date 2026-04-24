@@ -7,11 +7,8 @@ import numpy as np
 import pandas as pd
 import scipy.ndimage as ndi
 from scipy import stats
-
-# force non-interactive backend to prevent Tkinter Tcl thread crashes
 import matplotlib
 matplotlib.use('Agg')
-
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import matplotlib.colors as mcolors
@@ -647,7 +644,7 @@ def add_stat_annotation(ax, data, x_col, y_col, ref_cond):
             current_y += step * 1.5
 
 def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv_path_override=None, tmrm_max_range=0.25, pca_variance_threshold=0.95):
-    """saves single-cell data, runs PCA + tight UMAP and generates feature-colored plots"""
+    """saves single-cell data, aggregates 75th percentiles per well, runs PCA + UMAP, and plots."""
     if csv_path_override and os.path.exists(csv_path_override):
         df_cells = pd.read_csv(csv_path_override)
         parent_out_dir = os.path.dirname(csv_path_override)
@@ -671,8 +668,31 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
     conditions = sorted(df_cells['Treatment'].unique())
     ref_cond = "Vehicle" if "Vehicle" in conditions else conditions[0]
     
+    # identify numeric feature columns used for UMAP and aggregation
+    exclude_cols = [
+        'Treatment', 'Field', 'Well', 'UID', 
+        'Bins TMRM for intensity continuous plotting',
+        'Bins tubularness for intensity continuous plotting',
+        'Bins MTG for intensity continuous plotting'
+    ]
+    feature_cols = [c for c in df_cells.columns if c not in exclude_cols]
+
     # ----------------------------------------------------
-    # 1. Boxplot Analytics (Aggregated per Well)
+    # 1. Well-Level Aggregation (75% Quantile)
+    # ----------------------------------------------------
+    print("\nCalculating 75th percentile (Q3) well-level aggregates...")
+    well_agg_dir = os.path.join(parent_out_dir, "Well_Aggregates")
+    os.makedirs(well_agg_dir, exist_ok=True)
+    
+    # Calculate the 75% quantile for every physical feature, grouped by well
+    well_75_df = df_cells.groupby(['Well', 'Treatment'])[feature_cols].quantile(0.75).reset_index()
+    
+    agg_csv_path = os.path.join(well_agg_dir, "Well_75th_Percentiles.csv")
+    well_75_df.to_csv(agg_csv_path, index=False)
+    print(f"Exported well-level 75% quantile data to: {agg_csv_path}")
+
+    # ----------------------------------------------------
+    # 2. Boxplot Analytics (Aggregated per Well)
     # ----------------------------------------------------
     well_df = df_cells.groupby(['Well', 'Treatment']).agg(
         Median_Tubularness=('Median tubularness in MTG mask', 'median'),
@@ -698,7 +718,6 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
         ax.set_title(title, fontsize=14, fontweight='bold')
         ax.tick_params(axis='x', rotation=45)
         
-        # proper fix for the ticklabels warning
         ax.set_xticks(ax.get_xticks())
         labels = [item.get_text() for item in ax.get_xticklabels()]
         wrapped_labels = ['\n'.join(textwrap.wrap(label, width=20)) for label in labels]
@@ -709,20 +728,12 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
         plt.close(fig)
 
     # ----------------------------------------------------
-    # 2. PCA and UMAP Dimensionality Reduction
+    # 3. PCA and UMAP Dimensionality Reduction
     # ----------------------------------------------------
     print("\nRunning PCA + UMAP dimensionality reduction on single-cell data...")
-    exclude_cols = [
-        'Treatment', 'Field', 'Well', 'UID', 
-        'Bins TMRM for intensity continuous plotting',
-        'Bins tubularness for intensity continuous plotting',
-        'Bins MTG for intensity continuous plotting'
-    ]
-    feature_cols = [c for c in df_cells.columns if c not in exclude_cols]
-    
     X = df_cells[feature_cols].fillna(0).values
     
-    # log(x + 1) transform to normalize skewed distributions (like area/intensity) before pca
+    # log(x + 1) transform to normalize skewed distributions before pca
     X_log = np.log1p(np.clip(X, a_min=0, a_max=None))
     X_scaled = StandardScaler().fit_transform(X_log)
     
@@ -777,7 +788,7 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
     plt.close(fig_umap)
 
     # ----------------------------------------------------
-    # 3. Targeted UMAP Highlights per Condition
+    # 4. Targeted UMAP Highlights per Condition
     # ----------------------------------------------------
     print("Generating condition-specific UMAP highlights...")
     umap_hl_dir = os.path.join(parent_out_dir, "UMAP_Condition_Highlights")
@@ -810,7 +821,7 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
         plt.close(fig_hl)
 
     # ----------------------------------------------------
-    # 4. Point-Biserial Correlations & Barplots
+    # 5. Point-Biserial Correlations & Barplots
     # ----------------------------------------------------
     print("Calculating correlations between features and conditions...")
     corr_dir = os.path.join(parent_out_dir, "Treatment_Correlations")
@@ -818,10 +829,8 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
 
     corr_results = []
     
-    # calculate point-biserial correlation for every continuous feature against binary condition presence
     for cond in conditions:
         y_bin = (df_umap_meta['Treatment'] == cond).astype(float).values
-        # if the dataset has extremely low variance for a condition, skip to avoid division by zero
         if np.std(y_bin) == 0:
             continue
             
@@ -840,7 +849,6 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
             
     df_corr = pd.DataFrame(corr_results)
 
-    # generate sorted horizontal barplots for each feature
     for feature in feature_cols:
         feat_data = df_corr[df_corr['Feature'] == feature].copy()
         if feat_data.empty: continue
@@ -861,7 +869,7 @@ def aggregate_and_plot_data(all_cell_data, output_paths_dict, treatment_map, csv
         plt.close(fig_bar)
 
     # ----------------------------------------------------
-    # 5. UMAP viridis overlays for all physical metrics
+    # 6. UMAP viridis overlays for all physical metrics
     # ----------------------------------------------------
     print("Generating feature-colored UMAP overlays (viridis)...")
     umap_dir = os.path.join(parent_out_dir, "UMAP_Features")
